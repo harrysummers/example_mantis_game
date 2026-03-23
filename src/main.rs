@@ -186,7 +186,7 @@ impl MyGame {
 
         let projectiles = ProjectileManager::new(ProjectileConfig {
             speed: 1.5,
-            color: 0xFF0000,
+            color: 0xFFFFFF,
             length: 0.8,
             splash_color: 0xFFFF00,
             splash_duration: 30,
@@ -543,7 +543,7 @@ impl Game for MyGame {
         let head_targets: Vec<(Vec3, Vec3)> = self.enemies.iter()
             .map(|e| if e.alive { e.head_aabb() } else { dead_aabb(e) })
             .collect();
-        let head_hits = self.projectiles.check_hits(&head_targets);
+        let head_hits = self.projectiles.check_hits_colored(&head_targets, Some(0xFF0000));
         for hit in &head_hits {
             if let Some(enemy) = self.enemies.get_mut(hit.target_index) {
                 if enemy.alive {
@@ -560,7 +560,7 @@ impl Game for MyGame {
         let body_targets: Vec<(Vec3, Vec3)> = self.enemies.iter()
             .map(|e| if e.alive { e.body_aabb() } else { dead_aabb(e) })
             .collect();
-        let body_hits = self.projectiles.check_hits(&body_targets);
+        let body_hits = self.projectiles.check_hits_colored(&body_targets, Some(0xFF0000));
         for hit in &body_hits {
             if let Some(enemy) = self.enemies.get_mut(hit.target_index) {
                 if enemy.alive {
@@ -711,36 +711,27 @@ impl Game for MyGame {
                 &self.enemy_rifle,
             );
 
-            // Enemy health bar (world-space, segmented per 100 HP)
+            // Enemy health bar (world-space projected to screen)
             let bar_world = Vec3::new(
                 enemy.body.position.x,
                 enemy.body.position.y + enemy.body.height + 0.5,
                 enemy.body.position.z,
             );
             if let Some((sx, sy)) = self.camera.project_point(bar_world, width, height) {
-                let e_segs = (enemy.max_hp / 100).max(1) as i32;
-                let e_seg_w: i32 = 12;
-                let e_seg_gap: i32 = 1;
-                let e_bar_h: i32 = 4;
-                let e_total_w = e_segs * e_seg_w + (e_segs - 1) * e_seg_gap;
-                let bx = sx as i32 - e_total_w / 2;
+                let bar_w: i32 = 40;
+                let bar_h: i32 = 4;
+                let bx = sx as i32 - bar_w / 2;
                 let by = sy as i32;
+                let fill = (enemy.hp as f32 / enemy.max_hp as f32 * bar_w as f32) as i32;
 
-                for s in 0..e_segs {
-                    let seg_start = s * 100;
-                    let ex = bx + s * (e_seg_w + e_seg_gap);
-
-                    for dy in 0..e_bar_h {
-                        draw_line(buffer, width, height, ex, by + dy, ex + e_seg_w, by + dy, 0x663300);
-                    }
-                    if enemy.hp > seg_start {
-                        let frac = ((enemy.hp - seg_start) as f32 / 100.0).min(1.0);
-                        let fpx = (frac * e_seg_w as f32) as i32;
-                        if fpx > 0 {
-                            for dy in 0..e_bar_h {
-                                draw_line(buffer, width, height, ex, by + dy, ex + fpx, by + dy, ORANGE);
-                            }
-                        }
+                // Background
+                for dy in 0..bar_h {
+                    draw_line(buffer, width, height, bx, by + dy, bx + bar_w, by + dy, 0x663300);
+                }
+                // Fill
+                if fill > 0 {
+                    for dy in 0..bar_h {
+                        draw_line(buffer, width, height, bx, by + dy, bx + fill, by + dy, ORANGE);
                     }
                 }
             }
