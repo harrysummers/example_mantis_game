@@ -1,7 +1,7 @@
 use mantis::{
-    draw_character, draw_crosshair, draw_line_3d, draw_weapon, ray_aabb_intersection,
-    compute_muzzle_world, AssaultRifle, BlockFigure, Bounds, Camera, CharacterBody,
-    CharacterController, Engine, Game, Input, OtsCameraConfig, ProjectileConfig,
+    draw_character, draw_crosshair, draw_line_3d, draw_text, draw_weapon, ray_aabb_intersection,
+    text_width, text_height, compute_muzzle_world, AmmoState, AssaultRifle, BlockFigure, Bounds, Camera,
+    CharacterBody, CharacterController, Engine, Game, Input, OtsCameraConfig, ProjectileConfig,
     ProjectileManager, Vec3, Weapon, compute_ots_camera,
 };
 
@@ -29,6 +29,7 @@ struct MyGame {
     aim_point: Option<Vec3>,
     model: BlockFigure,
     rifle: AssaultRifle,
+    ammo: AmmoState,
     projectiles: ProjectileManager,
     vertices: [Vec3; 8],
     edges: [(usize, usize); 12],
@@ -100,6 +101,9 @@ impl MyGame {
             splash_size: 0.5,
         });
 
+        let rifle = AssaultRifle::new(0xFFFFFF);
+        let ammo = AmmoState::new(rifle.magazine_size(), rifle.reload_time());
+
         MyGame {
             camera,
             body,
@@ -109,7 +113,8 @@ impl MyGame {
             aim_pitch: 0.0,
             aim_point: None,
             model: BlockFigure::new(0xFFFFFF),
-            rifle: AssaultRifle::new(0xFFFFFF),
+            rifle,
+            ammo,
             projectiles,
             vertices,
             edges,
@@ -171,8 +176,13 @@ impl Game for MyGame {
             }
         }
 
-        // Fire projectile on left click
-        if input.mouse_left_click {
+        // Reload on R key
+        if input.key_r {
+            self.ammo.start_reload();
+        }
+
+        // Fire projectile while mouse held and ammo available
+        if input.mouse_left_down && self.ammo.can_fire() {
             if let Some(aim_world) = self.aim_point {
                 let muzzle_world = compute_muzzle_world(
                     &self.body,
@@ -183,8 +193,12 @@ impl Game for MyGame {
                     self.aim_pitch,
                 );
                 self.projectiles.fire(muzzle_world, aim_world);
+                self.ammo.fire(self.rifle.fire_interval());
             }
         }
+
+        // Tick ammo cooldown and reload timer
+        self.ammo.tick();
 
         // Update projectiles
         self.projectiles.update(self.room_min, self.room_max);
@@ -205,7 +219,14 @@ impl Game for MyGame {
         }
 
         let character_yaw_offset = -std::f32::consts::FRAC_PI_2;
-        let arm_pose = self.rifle.arm_pose();
+        let mut arm_pose = self.rifle.arm_pose();
+
+        // Apply reload animation: right arm bobs up and down twice
+        if self.ammo.reloading {
+            let t = self.ammo.reload_progress();
+            let offset = (t * 2.0 * std::f32::consts::PI).sin().abs() * 0.4;
+            arm_pose.right_upper_pitch -= offset;
+        }
 
         // Draw character model
         draw_character(
@@ -246,6 +267,16 @@ impl Game for MyGame {
 
         // Crosshair
         draw_crosshair(buffer, width, height, 10, 0xFFFFFF);
+
+        // Ammo HUD at bottom-right (2x scale)
+        let ammo_text = format!("{}/{}", self.ammo.ammo, self.ammo.magazine_size);
+        let scale = 2;
+        let padding = 20;
+        let tw = text_width(&ammo_text, scale);
+        let th = text_height(scale);
+        let x = width - tw - padding;
+        let y = height - th - padding;
+        draw_text(buffer, width, height, &ammo_text, x, y, 0xFFFFFF, scale);
     }
 }
 
