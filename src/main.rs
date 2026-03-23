@@ -24,7 +24,7 @@ const BODY_DAMAGE: i32 = 20;
 const HEAD_DAMAGE: i32 = 80;
 const ENEMY_DAMAGE: i32 = 10;
 const ENEMY_HP: i32 = 100;
-const PLAYER_HP: i32 = 100;
+const PLAYER_HP: i32 = 1000;
 const HIT_FLASH_FRAMES: u32 = 8;
 
 const RESPAWN_FRAMES: u32 = 120; // ~2 seconds at 60fps
@@ -32,12 +32,12 @@ const AI_MIN_FRAMES: u32 = 12;  // 0.2s at 60fps
 const AI_MAX_FRAMES: u32 = 120; // 2.0s at 60fps
 
 #[derive(Clone, Copy)]
-enum EnemyAction {
-    Walk { forward: bool, strafe: f32 },
-    Sprint { forward: bool, strafe: f32 },
-    Crouch,
-    Idle,
-    Shoot,
+struct EnemyAction {
+    shooting: bool,
+    crouching: bool,
+    walking: bool,
+    sprinting: bool,
+    turning: bool,
 }
 
 struct Enemy {
@@ -114,6 +114,7 @@ struct MyGame {
     enemy_rifle: AssaultRifle,
     player_hp: i32,
     player_max_hp: i32,
+    score: u32,
     spawn_seed: u32,
     enemy_projectiles: ProjectileManager,
     hit_flash: u32,
@@ -201,13 +202,15 @@ impl MyGame {
             Enemy {
                 body: enemy1_body, controller: new_enemy_controller(),
                 hp: ENEMY_HP, max_hp: ENEMY_HP, alive: true, death_timer: 0,
-                action: EnemyAction::Idle, action_timer: 30, turn_rate: 0.0,
+                action: EnemyAction { shooting: false, crouching: false, walking: false, sprinting: false, turning: false },
+                action_timer: 30, turn_rate: 0.0,
                 aim_pitch: 0.0, ammo: new_enemy_ammo(),
             },
             Enemy {
                 body: enemy2_body, controller: new_enemy_controller(),
                 hp: ENEMY_HP, max_hp: ENEMY_HP, alive: true, death_timer: 0,
-                action: EnemyAction::Idle, action_timer: 60, turn_rate: 0.0,
+                action: EnemyAction { shooting: false, crouching: false, walking: false, sprinting: false, turning: false },
+                action_timer: 60, turn_rate: 0.0,
                 aim_pitch: 0.0, ammo: new_enemy_ammo(),
             },
         ];
@@ -243,6 +246,7 @@ impl MyGame {
             enemy_rifle: AssaultRifle::new(ORANGE),
             player_hp: PLAYER_HP,
             player_max_hp: PLAYER_HP,
+            score: 0,
             spawn_seed: 12345,
             enemy_projectiles,
             hit_flash: 0,
@@ -265,19 +269,22 @@ impl MyGame {
         let duration = AI_MIN_FRAMES + (self.rand_f32() * (AI_MAX_FRAMES - AI_MIN_FRAMES) as f32) as u32;
         let turn_rate = (self.rand_f32() - 0.5) * 0.06;
 
-        let choice = self.rand() % 5;
-        let strafe = match self.rand() % 3 { 0 => -1.0, 1 => 0.0, _ => 1.0 };
-        let forward = self.rand() % 2 == 0;
-
-        let action = match choice {
-            0 => EnemyAction::Walk { forward, strafe },
-            1 => EnemyAction::Sprint { forward, strafe },
-            2 => EnemyAction::Crouch,
-            3 => EnemyAction::Shoot,
-            _ => EnemyAction::Idle,
+        // 11 equally likely combos
+        let action = match self.rand() % 11 {
+            0  => EnemyAction { shooting: false, crouching: false, walking: false, sprinting: false, turning: false }, // standing
+            1  => EnemyAction { shooting: false, crouching: true,  walking: false, sprinting: false, turning: false }, // crouching
+            2  => EnemyAction { shooting: false, crouching: false, walking: false, sprinting: true,  turning: false }, // sprinting
+            3  => EnemyAction { shooting: false, crouching: false, walking: true,  sprinting: false, turning: false }, // walking
+            4  => EnemyAction { shooting: false, crouching: false, walking: false, sprinting: false, turning: true  }, // turning
+            5  => EnemyAction { shooting: false, crouching: false, walking: true,  sprinting: false, turning: true  }, // turning + walking
+            6  => EnemyAction { shooting: false, crouching: false, walking: false, sprinting: true,  turning: true  }, // turning + sprinting
+            7  => EnemyAction { shooting: true,  crouching: false, walking: false, sprinting: false, turning: false }, // standing + firing
+            8  => EnemyAction { shooting: true,  crouching: true,  walking: false, sprinting: false, turning: false }, // firing + crouching
+            9  => EnemyAction { shooting: true,  crouching: false, walking: true,  sprinting: false, turning: false }, // firing + walking
+            _  => EnemyAction { shooting: true,  crouching: false, walking: false, sprinting: true,  turning: false }, // firing + sprinting
         };
-        // No turning while shooting — face player instead
-        let turn_rate = if matches!(action, EnemyAction::Shoot) { 0.0 } else { turn_rate };
+
+        let turn_rate = if action.shooting { 0.0 } else { turn_rate };
         (action, duration, turn_rate)
     }
 }
@@ -313,7 +320,7 @@ impl Game for MyGame {
         let mut new_actions: Vec<Option<(EnemyAction, u32, f32)>> = Vec::new();
         for enemy in &self.enemies {
             if enemy.alive && enemy.action_timer == 0 {
-                new_actions.push(Some((EnemyAction::Idle, 0, 0.0)));
+                new_actions.push(Some((EnemyAction { shooting: false, crouching: false, walking: false, sprinting: false, turning: false }, 0, 0.0)));
             } else {
                 new_actions.push(None);
             }
@@ -338,14 +345,14 @@ impl Game for MyGame {
 
             enemy.ammo.tick();
 
+            let act = enemy.action;
+
             // Shooting: face player, aim, fire
-            if matches!(enemy.action, EnemyAction::Shoot) {
-                // Turn to face player
+            if act.shooting {
                 let dx = player_center.x - enemy.body.position.x;
                 let dz = player_center.z - enemy.body.position.z;
                 enemy.body.yaw = dz.atan2(dx);
 
-                // Compute aim pitch
                 let e_crouch = enemy.controller.crouch_factor();
                 let e_upper_leg = enemy.body.height * 0.22;
                 let e_hip_drop = e_upper_leg * e_crouch;
@@ -362,7 +369,6 @@ impl Game for MyGame {
                     enemy.aim_pitch = -(dy_aim / dz_aim).atan();
                 }
 
-                // Fire
                 if enemy.ammo.can_fire() {
                     let muzzle_world = compute_muzzle_world(
                         &enemy.body, &self.enemy_rifle,
@@ -374,30 +380,23 @@ impl Game for MyGame {
                 }
             } else {
                 enemy.aim_pitch = 0.0;
+            }
+
+            // Turning (only when not shooting — shooting faces player instead)
+            if act.turning && !act.shooting {
                 enemy.body.yaw += enemy.turn_rate;
             }
 
-            // Build fake input from current action
-            let base = Input {
+            // Build fake input
+            let fake_input = Input {
                 mouse_dx: 0.0, mouse_dy: 0.0,
                 mouse_left_click: false, mouse_left_down: false,
-                key_w: false, key_a: false, key_s: false, key_d: false,
-                key_space: false, key_shift: false, key_ctrl: false, key_r: false,
-            };
-            let fake_input = match enemy.action {
-                EnemyAction::Walk { forward, strafe } => Input {
-                    key_w: forward, key_s: !forward,
-                    key_a: strafe < 0.0, key_d: strafe > 0.0,
-                    ..base
-                },
-                EnemyAction::Sprint { forward, strafe } => Input {
-                    key_w: forward, key_s: !forward,
-                    key_a: strafe < 0.0, key_d: strafe > 0.0,
-                    key_shift: true,
-                    ..base
-                },
-                EnemyAction::Crouch => Input { key_ctrl: true, ..base },
-                EnemyAction::Idle | EnemyAction::Shoot => base,
+                key_w: act.walking || act.sprinting,
+                key_a: false, key_s: false, key_d: false,
+                key_space: false,
+                key_shift: act.sprinting,
+                key_ctrl: act.crouching,
+                key_r: false,
             };
 
             enemy.controller.update(&mut enemy.body, &fake_input, floor_y, ceiling_y);
@@ -501,6 +500,7 @@ impl Game for MyGame {
                     if enemy.hp <= 0 {
                         enemy.alive = false;
                         enemy.death_timer = RESPAWN_FRAMES;
+                        self.score += 1;
                     }
                 }
             }
@@ -517,6 +517,7 @@ impl Game for MyGame {
                     if enemy.hp <= 0 {
                         enemy.alive = false;
                         enemy.death_timer = RESPAWN_FRAMES;
+                        self.score += 1;
                     }
                 }
             }
@@ -565,7 +566,7 @@ impl Game for MyGame {
                     enemy.controller = CharacterController::new(
                         MOVE_SPEED, SPRINT_MULTIPLIER, JUMP_FORCE, GRAVITY, CROUCH_OFFSET,
                     );
-                    enemy.action = EnemyAction::Idle;
+                    enemy.action = EnemyAction { shooting: false, crouching: false, walking: false, sprinting: false, turning: false };
                     enemy.action_timer = 30;
                     enemy.turn_rate = 0.0;
                     enemy.aim_pitch = 0.0;
@@ -687,6 +688,16 @@ impl Game for MyGame {
         // Draw projectiles (player and enemy)
         self.projectiles.draw(buffer, width, height, &self.camera);
         self.enemy_projectiles.draw(buffer, width, height, &self.camera);
+
+        // Score HUD at top-right
+        {
+            let score_text = format!("Score: {}", self.score);
+            let s_scale = 2;
+            let s_padding = 20;
+            let s_tw = text_width(&score_text, s_scale);
+            let s_x = width - s_tw - s_padding;
+            draw_text(buffer, width, height, &score_text, s_x, s_padding, 0xFFFFFF, s_scale);
+        }
 
         // Crosshair
         draw_crosshair(buffer, width, height, 10, 0xFFFFFF);
