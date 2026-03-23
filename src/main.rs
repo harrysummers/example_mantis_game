@@ -670,11 +670,11 @@ impl Game for MyGame {
 
         // Player filled
         let mut arm_pose = self.rifle.arm_pose();
-        if self.ammo.reloading {
-            let t = self.ammo.reload_progress();
-            let offset = (t * 2.0 * std::f32::consts::PI).sin().abs() * 0.4;
-            arm_pose.right_upper_pitch -= offset;
-        }
+        let weapon_pitch = if self.ammo.reloading {
+            self.aim_pitch + std::f32::consts::FRAC_PI_4
+        } else {
+            self.aim_pitch
+        };
 
         let player_fill = if self.hit_flash > 0 { 0xFF0000 } else { 0xFFFFFF };
         draw_character_filled(
@@ -691,7 +691,7 @@ impl Game for MyGame {
         let hip_y = self.body.height * 0.45 - hip_drop;
         draw_weapon_filled(
             buffer, &mut self.zbuf, width, height, &self.camera,
-            &self.body, shoulder_y, hip_y, character_yaw_offset, self.aim_pitch,
+            &self.body, shoulder_y, hip_y, character_yaw_offset, weapon_pitch,
             &self.rifle, 0x111111,
         );
 
@@ -733,7 +733,7 @@ impl Game for MyGame {
         );
         draw_weapon(
             buffer, width, height, &self.camera,
-            &self.body, shoulder_y, hip_y, character_yaw_offset, self.aim_pitch, &self.rifle,
+            &self.body, shoulder_y, hip_y, character_yaw_offset, weapon_pitch, &self.rifle,
         );
 
         // Enemy health bars
@@ -821,8 +821,16 @@ impl Game for MyGame {
 
         // Start screen
         if !self.started {
+            let title = "Mantis Shooter";
+            let title_scale = 6;
+            let title_tw = text_width(title, title_scale);
+            let title_th = text_height(title_scale);
+            let title_x = (width - title_tw) / 2;
+            let title_y = height / 2 - title_th - 40;
+            draw_text(buffer, width, height, title, title_x, title_y, 0xFFFFFF, title_scale);
+
             let btn_cx = width / 2;
-            let btn_cy = height / 2;
+            let btn_cy = height / 2 + 20;
             let result = draw_button(
                 buffer, width, height,
                 "Start Game", btn_cx, btn_cy,
