@@ -22,8 +22,10 @@ const ROOM_D: f32 = 40.0;
 const ORANGE: u32 = 0xFF8800;
 const BODY_DAMAGE: i32 = 20;
 const HEAD_DAMAGE: i32 = 80;
+const ENEMY_DAMAGE: i32 = 10;
 const ENEMY_HP: i32 = 100;
 const PLAYER_HP: i32 = 100;
+const HIT_FLASH_FRAMES: u32 = 8;
 
 const RESPAWN_FRAMES: u32 = 120; // ~2 seconds at 60fps
 const AI_MIN_FRAMES: u32 = 12;  // 0.2s at 60fps
@@ -31,10 +33,11 @@ const AI_MAX_FRAMES: u32 = 120; // 2.0s at 60fps
 
 #[derive(Clone, Copy)]
 enum EnemyAction {
-    Walk { forward: bool, strafe: f32 }, // strafe: -1 left, 0 none, 1 right
+    Walk { forward: bool, strafe: f32 },
     Sprint { forward: bool, strafe: f32 },
     Crouch,
     Idle,
+    Shoot,
 }
 
 struct Enemy {
@@ -46,7 +49,9 @@ struct Enemy {
     death_timer: u32,
     action: EnemyAction,
     action_timer: u32,
-    turn_rate: f32, // radians per frame during this action
+    turn_rate: f32,
+    aim_pitch: f32,
+    ammo: AmmoState,
 }
 
 impl Enemy {
@@ -110,6 +115,9 @@ struct MyGame {
     player_hp: i32,
     player_max_hp: i32,
     spawn_seed: u32,
+    enemy_projectiles: ProjectileManager,
+    hit_flash: u32,
+    game_over: bool,
 }
 
 impl MyGame {
@@ -186,19 +194,32 @@ impl MyGame {
         let new_enemy_controller = || CharacterController::new(
             MOVE_SPEED, SPRINT_MULTIPLIER, JUMP_FORCE, GRAVITY, CROUCH_OFFSET,
         );
+        let enemy_rifle_ref = AssaultRifle::new(ORANGE);
+        let new_enemy_ammo = || AmmoState::new(enemy_rifle_ref.magazine_size(), enemy_rifle_ref.reload_time());
 
         let enemies = vec![
             Enemy {
                 body: enemy1_body, controller: new_enemy_controller(),
                 hp: ENEMY_HP, max_hp: ENEMY_HP, alive: true, death_timer: 0,
                 action: EnemyAction::Idle, action_timer: 30, turn_rate: 0.0,
+                aim_pitch: 0.0, ammo: new_enemy_ammo(),
             },
             Enemy {
                 body: enemy2_body, controller: new_enemy_controller(),
                 hp: ENEMY_HP, max_hp: ENEMY_HP, alive: true, death_timer: 0,
                 action: EnemyAction::Idle, action_timer: 60, turn_rate: 0.0,
+                aim_pitch: 0.0, ammo: new_enemy_ammo(),
             },
         ];
+
+        let enemy_projectiles = ProjectileManager::new(ProjectileConfig {
+            speed: 1.5,
+            color: ORANGE,
+            length: 0.8,
+            splash_color: 0xFF4400,
+            splash_duration: 30,
+            splash_size: 0.5,
+        });
 
         MyGame {
             camera,
@@ -223,6 +244,9 @@ impl MyGame {
             player_hp: PLAYER_HP,
             player_max_hp: PLAYER_HP,
             spawn_seed: 12345,
+            enemy_projectiles,
+            hit_flash: 0,
+            game_over: false,
         }
     }
     fn rand(&mut self) -> u32 {
@@ -239,9 +263,9 @@ impl MyGame {
 
     fn random_action(&mut self) -> (EnemyAction, u32, f32) {
         let duration = AI_MIN_FRAMES + (self.rand_f32() * (AI_MAX_FRAMES - AI_MIN_FRAMES) as f32) as u32;
-        let turn_rate = (self.rand_f32() - 0.5) * 0.06; // up to ~1.7 deg/frame
+        let turn_rate = (self.rand_f32() - 0.5) * 0.06;
 
-        let choice = self.rand() % 4;
+        let choice = self.rand() % 5;
         let strafe = match self.rand() % 3 { 0 => -1.0, 1 => 0.0, _ => 1.0 };
         let forward = self.rand() % 2 == 0;
 
@@ -249,14 +273,20 @@ impl MyGame {
             0 => EnemyAction::Walk { forward, strafe },
             1 => EnemyAction::Sprint { forward, strafe },
             2 => EnemyAction::Crouch,
+            3 => EnemyAction::Shoot,
             _ => EnemyAction::Idle,
         };
+        // No turning while shooting — face player instead
+        let turn_rate = if matches!(action, EnemyAction::Shoot) { 0.0 } else { turn_rate };
         (action, duration, turn_rate)
     }
 }
 
 impl Game for MyGame {
     fn update(&mut self, input: &Input) {
+        // Skip all gameplay if game over
+        if self.game_over { return; }
+
         self.body.yaw += input.mouse_dx * MOUSE_SENSITIVITY;
         self.camera_pitch += input.mouse_dy * MOUSE_SENSITIVITY;
         self.camera_pitch = self.camera_pitch.clamp(
@@ -270,12 +300,20 @@ impl Game for MyGame {
 
         self.bounds.clamp(&mut self.body.position);
 
+        // Tick hit flash
+        if self.hit_flash > 0 { self.hit_flash -= 1; }
+
+        // Capture player target for enemy aiming
+        let player_pos = self.body.position;
+        let player_eff_h = self.controller.effective_height(self.body.height);
+        let player_center = Vec3::new(player_pos.x, player_pos.y + player_eff_h * 0.5, player_pos.z);
+        let character_yaw_offset = -std::f32::consts::FRAC_PI_2;
+
         // Update enemy AI
-        // Collect new actions first to avoid borrow issues with self.rand()
         let mut new_actions: Vec<Option<(EnemyAction, u32, f32)>> = Vec::new();
         for enemy in &self.enemies {
             if enemy.alive && enemy.action_timer == 0 {
-                new_actions.push(Some((EnemyAction::Idle, 0, 0.0))); // placeholder
+                new_actions.push(Some((EnemyAction::Idle, 0, 0.0)));
             } else {
                 new_actions.push(None);
             }
@@ -288,23 +326,59 @@ impl Game for MyGame {
         for (i, enemy) in self.enemies.iter_mut().enumerate() {
             if !enemy.alive { continue; }
 
-            // Apply new action if timer expired
             if let Some(Some((action, duration, turn_rate))) = new_actions.get(i) {
                 enemy.action = *action;
                 enemy.action_timer = *duration;
                 enemy.turn_rate = *turn_rate;
             }
 
-            // Tick timer
             if enemy.action_timer > 0 {
                 enemy.action_timer -= 1;
             }
 
-            // Apply turn
-            enemy.body.yaw += enemy.turn_rate;
+            enemy.ammo.tick();
+
+            // Shooting: face player, aim, fire
+            if matches!(enemy.action, EnemyAction::Shoot) {
+                // Turn to face player
+                let dx = player_center.x - enemy.body.position.x;
+                let dz = player_center.z - enemy.body.position.z;
+                enemy.body.yaw = dz.atan2(dx);
+
+                // Compute aim pitch
+                let e_crouch = enemy.controller.crouch_factor();
+                let e_upper_leg = enemy.body.height * 0.22;
+                let e_hip_drop = e_upper_leg * e_crouch;
+                let e_shoulder_y = enemy.body.height * 0.78 - e_hip_drop;
+                let e_hip_y = enemy.body.height * 0.45 - e_hip_drop;
+
+                let rotation = enemy.body.yaw + character_yaw_offset;
+                let relative = player_center.sub(enemy.body.position);
+                let local_aim = relative.rotate_y(-rotation);
+                let muzzle_local = self.enemy_rifle.muzzle_position(enemy.body.height, e_shoulder_y);
+                let dz_aim = local_aim.z - muzzle_local.z;
+                let dy_aim = local_aim.y - muzzle_local.y;
+                if dz_aim.abs() > 0.01 {
+                    enemy.aim_pitch = -(dy_aim / dz_aim).atan();
+                }
+
+                // Fire
+                if enemy.ammo.can_fire() {
+                    let muzzle_world = compute_muzzle_world(
+                        &enemy.body, &self.enemy_rifle,
+                        e_shoulder_y, e_hip_y,
+                        character_yaw_offset, enemy.aim_pitch,
+                    );
+                    self.enemy_projectiles.fire(muzzle_world, player_center);
+                    enemy.ammo.fire(self.enemy_rifle.fire_interval());
+                }
+            } else {
+                enemy.aim_pitch = 0.0;
+                enemy.body.yaw += enemy.turn_rate;
+            }
 
             // Build fake input from current action
-            let fake_input = Input {
+            let base = Input {
                 mouse_dx: 0.0, mouse_dy: 0.0,
                 mouse_left_click: false, mouse_left_down: false,
                 key_w: false, key_a: false, key_s: false, key_d: false,
@@ -314,16 +388,16 @@ impl Game for MyGame {
                 EnemyAction::Walk { forward, strafe } => Input {
                     key_w: forward, key_s: !forward,
                     key_a: strafe < 0.0, key_d: strafe > 0.0,
-                    ..fake_input
+                    ..base
                 },
                 EnemyAction::Sprint { forward, strafe } => Input {
                     key_w: forward, key_s: !forward,
                     key_a: strafe < 0.0, key_d: strafe > 0.0,
                     key_shift: true,
-                    ..fake_input
+                    ..base
                 },
-                EnemyAction::Crouch => Input { key_ctrl: true, ..fake_input },
-                EnemyAction::Idle => fake_input,
+                EnemyAction::Crouch => Input { key_ctrl: true, ..base },
+                EnemyAction::Idle | EnemyAction::Shoot => base,
             };
 
             enemy.controller.update(&mut enemy.body, &fake_input, floor_y, ceiling_y);
@@ -448,6 +522,27 @@ impl Game for MyGame {
             }
         }
 
+        // Update enemy projectiles and check hits against player
+        self.enemy_projectiles.update(self.room_min, self.room_max);
+        {
+            let player_hw = self.body.height * 0.18;
+            let player_h = self.controller.effective_height(self.body.height);
+            let p = self.body.position;
+            let player_target = vec![(
+                Vec3::new(p.x - player_hw, p.y, p.z - player_hw),
+                Vec3::new(p.x + player_hw, p.y + player_h, p.z + player_hw),
+            )];
+            let hits = self.enemy_projectiles.check_hits(&player_target);
+            for _ in &hits {
+                self.player_hp -= ENEMY_DAMAGE;
+                self.hit_flash = HIT_FLASH_FRAMES;
+                if self.player_hp <= 0 {
+                    self.player_hp = 0;
+                    self.game_over = true;
+                }
+            }
+        }
+
         // Respawn dead enemies after timer expires
         let margin = 2.0;
         let spawn_hw = ROOM_W / 2.0 - margin;
@@ -473,6 +568,8 @@ impl Game for MyGame {
                     enemy.action = EnemyAction::Idle;
                     enemy.action_timer = 30;
                     enemy.turn_rate = 0.0;
+                    enemy.aim_pitch = 0.0;
+                    enemy.ammo = AmmoState::new(self.enemy_rifle.magazine_size(), self.enemy_rifle.reload_time());
                 }
             }
         }
@@ -546,7 +643,7 @@ impl Game for MyGame {
             draw_character(
                 buffer, width, height, &self.camera,
                 &enemy.body, e_crouch, character_yaw_offset,
-                Some(&enemy_arm_pose), 0.0, e_walk,
+                Some(&enemy_arm_pose), enemy.aim_pitch, e_walk,
                 &self.enemy_model,
             );
 
@@ -557,7 +654,7 @@ impl Game for MyGame {
             draw_weapon(
                 buffer, width, height, &self.camera,
                 &enemy.body, e_shoulder_y, e_hip_y,
-                character_yaw_offset, 0.0,
+                character_yaw_offset, enemy.aim_pitch,
                 &self.enemy_rifle,
             );
 
@@ -587,8 +684,9 @@ impl Game for MyGame {
             }
         }
 
-        // Draw projectiles
+        // Draw projectiles (player and enemy)
         self.projectiles.draw(buffer, width, height, &self.camera);
+        self.enemy_projectiles.draw(buffer, width, height, &self.camera);
 
         // Crosshair
         draw_crosshair(buffer, width, height, 10, 0xFFFFFF);
@@ -617,6 +715,29 @@ impl Game for MyGame {
             for dy in 0..hp_bar_h {
                 draw_line(buffer, width, height, hp_bar_x, hp_bar_y + dy, hp_bar_x + hp_fill, hp_bar_y + dy, 0xFFFFFF);
             }
+        }
+
+        // Red flash overlay when hit
+        if self.hit_flash > 0 {
+            let alpha = self.hit_flash as f32 / HIT_FLASH_FRAMES as f32;
+            let tint_r = (alpha * 180.0) as u32;
+            for pixel in buffer.iter_mut() {
+                let r = ((*pixel >> 16) & 0xFF).min(255 - tint_r) + tint_r;
+                let g = ((*pixel >> 8) & 0xFF) * 3 / 4;
+                let b = (*pixel & 0xFF) * 3 / 4;
+                *pixel = (r << 16) | (g << 8) | b;
+            }
+        }
+
+        // Game over screen
+        if self.game_over {
+            let go_scale = 6;
+            let go_text = "GAME OVER";
+            let go_tw = text_width(go_text, go_scale);
+            let go_th = text_height(go_scale);
+            let go_x = (width - go_tw) / 2;
+            let go_y = (height - go_th) / 2;
+            draw_text(buffer, width, height, go_text, go_x, go_y, 0xFF0000, go_scale);
         }
     }
 }
