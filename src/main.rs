@@ -26,20 +26,39 @@ const ENEMY_HP: i32 = 100;
 const PLAYER_HP: i32 = 100;
 
 const RESPAWN_FRAMES: u32 = 120; // ~2 seconds at 60fps
+const AI_MIN_FRAMES: u32 = 12;  // 0.2s at 60fps
+const AI_MAX_FRAMES: u32 = 120; // 2.0s at 60fps
+
+#[derive(Clone, Copy)]
+enum EnemyAction {
+    Walk { forward: bool, strafe: f32 }, // strafe: -1 left, 0 none, 1 right
+    Sprint { forward: bool, strafe: f32 },
+    Crouch,
+    Idle,
+}
 
 struct Enemy {
     body: CharacterBody,
+    controller: CharacterController,
     hp: i32,
     max_hp: i32,
     alive: bool,
     death_timer: u32,
+    action: EnemyAction,
+    action_timer: u32,
+    turn_rate: f32, // radians per frame during this action
 }
 
 impl Enemy {
+    fn eff_height(&self) -> f32 {
+        self.controller.effective_height(self.body.height)
+    }
+
     fn body_aabb(&self) -> (Vec3, Vec3) {
         let hw = self.body.height * 0.18;
         let hd = self.body.height * 0.18;
-        let neck_y = self.body.position.y + self.body.height * 0.84;
+        let h = self.eff_height();
+        let neck_y = self.body.position.y + h * 0.84;
         (
             Vec3::new(self.body.position.x - hw, self.body.position.y, self.body.position.z - hd),
             Vec3::new(self.body.position.x + hw, neck_y, self.body.position.z + hd),
@@ -48,8 +67,9 @@ impl Enemy {
 
     fn head_aabb(&self) -> (Vec3, Vec3) {
         let r = self.body.height * 0.1;
-        let neck_y = self.body.position.y + self.body.height * 0.84;
-        let top_y = self.body.position.y + self.body.height;
+        let h = self.eff_height();
+        let neck_y = self.body.position.y + h * 0.84;
+        let top_y = self.body.position.y + h;
         (
             Vec3::new(self.body.position.x - r, neck_y, self.body.position.z - r),
             Vec3::new(self.body.position.x + r, top_y, self.body.position.z + r),
@@ -59,9 +79,10 @@ impl Enemy {
     fn full_aabb(&self) -> (Vec3, Vec3) {
         let hw = self.body.height * 0.18;
         let hd = self.body.height * 0.18;
+        let h = self.eff_height();
         (
             Vec3::new(self.body.position.x - hw, self.body.position.y, self.body.position.z - hd),
-            Vec3::new(self.body.position.x + hw, self.body.position.y + self.body.height, self.body.position.z + hd),
+            Vec3::new(self.body.position.x + hw, self.body.position.y + h, self.body.position.z + hd),
         )
     }
 }
@@ -162,9 +183,21 @@ impl MyGame {
         let mut enemy2_body = CharacterBody::new(Vec3::new(8.0, floor_y, 8.0), CHARACTER_HEIGHT);
         enemy2_body.yaw = std::f32::consts::FRAC_PI_4 + std::f32::consts::PI;
 
+        let new_enemy_controller = || CharacterController::new(
+            MOVE_SPEED, SPRINT_MULTIPLIER, JUMP_FORCE, GRAVITY, CROUCH_OFFSET,
+        );
+
         let enemies = vec![
-            Enemy { body: enemy1_body, hp: ENEMY_HP, max_hp: ENEMY_HP, alive: true, death_timer: 0 },
-            Enemy { body: enemy2_body, hp: ENEMY_HP, max_hp: ENEMY_HP, alive: true, death_timer: 0 },
+            Enemy {
+                body: enemy1_body, controller: new_enemy_controller(),
+                hp: ENEMY_HP, max_hp: ENEMY_HP, alive: true, death_timer: 0,
+                action: EnemyAction::Idle, action_timer: 30, turn_rate: 0.0,
+            },
+            Enemy {
+                body: enemy2_body, controller: new_enemy_controller(),
+                hp: ENEMY_HP, max_hp: ENEMY_HP, alive: true, death_timer: 0,
+                action: EnemyAction::Idle, action_timer: 60, turn_rate: 0.0,
+            },
         ];
 
         MyGame {
@@ -192,6 +225,34 @@ impl MyGame {
             spawn_seed: 12345,
         }
     }
+    fn rand(&mut self) -> u32 {
+        self.spawn_seed ^= self.spawn_seed << 13;
+        self.spawn_seed ^= self.spawn_seed >> 17;
+        self.spawn_seed ^= self.spawn_seed << 5;
+        self.spawn_seed
+    }
+
+    /// Returns a float in [0.0, 1.0)
+    fn rand_f32(&mut self) -> f32 {
+        self.rand() as f32 / u32::MAX as f32
+    }
+
+    fn random_action(&mut self) -> (EnemyAction, u32, f32) {
+        let duration = AI_MIN_FRAMES + (self.rand_f32() * (AI_MAX_FRAMES - AI_MIN_FRAMES) as f32) as u32;
+        let turn_rate = (self.rand_f32() - 0.5) * 0.06; // up to ~1.7 deg/frame
+
+        let choice = self.rand() % 4;
+        let strafe = match self.rand() % 3 { 0 => -1.0, 1 => 0.0, _ => 1.0 };
+        let forward = self.rand() % 2 == 0;
+
+        let action = match choice {
+            0 => EnemyAction::Walk { forward, strafe },
+            1 => EnemyAction::Sprint { forward, strafe },
+            2 => EnemyAction::Crouch,
+            _ => EnemyAction::Idle,
+        };
+        (action, duration, turn_rate)
+    }
 }
 
 impl Game for MyGame {
@@ -208,6 +269,66 @@ impl Game for MyGame {
         self.controller.update(&mut self.body, input, floor_y, ceiling_y);
 
         self.bounds.clamp(&mut self.body.position);
+
+        // Update enemy AI
+        // Collect new actions first to avoid borrow issues with self.rand()
+        let mut new_actions: Vec<Option<(EnemyAction, u32, f32)>> = Vec::new();
+        for enemy in &self.enemies {
+            if enemy.alive && enemy.action_timer == 0 {
+                new_actions.push(Some((EnemyAction::Idle, 0, 0.0))); // placeholder
+            } else {
+                new_actions.push(None);
+            }
+        }
+        for item in &mut new_actions {
+            if item.is_some() {
+                *item = Some(self.random_action());
+            }
+        }
+        for (i, enemy) in self.enemies.iter_mut().enumerate() {
+            if !enemy.alive { continue; }
+
+            // Apply new action if timer expired
+            if let Some(Some((action, duration, turn_rate))) = new_actions.get(i) {
+                enemy.action = *action;
+                enemy.action_timer = *duration;
+                enemy.turn_rate = *turn_rate;
+            }
+
+            // Tick timer
+            if enemy.action_timer > 0 {
+                enemy.action_timer -= 1;
+            }
+
+            // Apply turn
+            enemy.body.yaw += enemy.turn_rate;
+
+            // Build fake input from current action
+            let fake_input = Input {
+                mouse_dx: 0.0, mouse_dy: 0.0,
+                mouse_left_click: false, mouse_left_down: false,
+                key_w: false, key_a: false, key_s: false, key_d: false,
+                key_space: false, key_shift: false, key_ctrl: false, key_r: false,
+            };
+            let fake_input = match enemy.action {
+                EnemyAction::Walk { forward, strafe } => Input {
+                    key_w: forward, key_s: !forward,
+                    key_a: strafe < 0.0, key_d: strafe > 0.0,
+                    ..fake_input
+                },
+                EnemyAction::Sprint { forward, strafe } => Input {
+                    key_w: forward, key_s: !forward,
+                    key_a: strafe < 0.0, key_d: strafe > 0.0,
+                    key_shift: true,
+                    ..fake_input
+                },
+                EnemyAction::Crouch => Input { key_ctrl: true, ..fake_input },
+                EnemyAction::Idle => fake_input,
+            };
+
+            enemy.controller.update(&mut enemy.body, &fake_input, floor_y, ceiling_y);
+            self.bounds.clamp(&mut enemy.body.position);
+        }
 
         let eff_height = self.controller.effective_height(self.body.height);
         compute_ots_camera(
@@ -329,29 +450,29 @@ impl Game for MyGame {
 
         // Respawn dead enemies after timer expires
         let margin = 2.0;
-        let hw = ROOM_W / 2.0 - margin;
-        let hd = ROOM_D / 2.0 - margin;
+        let spawn_hw = ROOM_W / 2.0 - margin;
+        let spawn_hd = ROOM_D / 2.0 - margin;
         let floor_y = -ROOM_H / 2.0;
-        for enemy in &mut self.enemies {
+        // Pre-generate random values to avoid borrow conflict
+        let spawn_randoms: Vec<(f32, f32)> = (0..self.enemies.len())
+            .map(|_| (self.rand_f32() * 2.0 - 1.0, self.rand_f32() * 2.0 - 1.0))
+            .collect();
+        for (i, enemy) in self.enemies.iter_mut().enumerate() {
             if !enemy.alive {
                 if enemy.death_timer > 0 {
                     enemy.death_timer -= 1;
                 } else {
-                    // Simple pseudo-random position using xorshift
-                    self.spawn_seed ^= self.spawn_seed << 13;
-                    self.spawn_seed ^= self.spawn_seed >> 17;
-                    self.spawn_seed ^= self.spawn_seed << 5;
-                    let rx = (self.spawn_seed as f32 / u32::MAX as f32) * 2.0 - 1.0;
-                    self.spawn_seed ^= self.spawn_seed << 13;
-                    self.spawn_seed ^= self.spawn_seed >> 17;
-                    self.spawn_seed ^= self.spawn_seed << 5;
-                    let rz = (self.spawn_seed as f32 / u32::MAX as f32) * 2.0 - 1.0;
-
-                    enemy.body.position = Vec3::new(rx * hw, floor_y, rz * hd);
-                    // Face toward center
+                    let (rx, rz) = spawn_randoms[i];
+                    enemy.body.position = Vec3::new(rx * spawn_hw, floor_y, rz * spawn_hd);
                     enemy.body.yaw = (-enemy.body.position.x).atan2(-enemy.body.position.z);
                     enemy.hp = enemy.max_hp;
                     enemy.alive = true;
+                    enemy.controller = CharacterController::new(
+                        MOVE_SPEED, SPRINT_MULTIPLIER, JUMP_FORCE, GRAVITY, CROUCH_OFFSET,
+                    );
+                    enemy.action = EnemyAction::Idle;
+                    enemy.action_timer = 30;
+                    enemy.turn_rate = 0.0;
                 }
             }
         }
@@ -420,15 +541,19 @@ impl Game for MyGame {
         for enemy in &self.enemies {
             if !enemy.alive { continue; }
 
+            let e_crouch = enemy.controller.crouch_factor();
+            let e_walk = enemy.controller.walk_cycle();
             draw_character(
                 buffer, width, height, &self.camera,
-                &enemy.body, 0.0, character_yaw_offset,
-                Some(&enemy_arm_pose), 0.0, 0.0,
+                &enemy.body, e_crouch, character_yaw_offset,
+                Some(&enemy_arm_pose), 0.0, e_walk,
                 &self.enemy_model,
             );
 
-            let e_shoulder_y = enemy.body.height * 0.78;
-            let e_hip_y = enemy.body.height * 0.45;
+            let e_upper_leg = enemy.body.height * 0.22;
+            let e_hip_drop = e_upper_leg * e_crouch;
+            let e_shoulder_y = enemy.body.height * 0.78 - e_hip_drop;
+            let e_hip_y = enemy.body.height * 0.45 - e_hip_drop;
             draw_weapon(
                 buffer, width, height, &self.camera,
                 &enemy.body, e_shoulder_y, e_hip_y,
