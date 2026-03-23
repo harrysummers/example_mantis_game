@@ -1,7 +1,8 @@
 use mantis::{
     draw_character, draw_crosshair, draw_line_3d, draw_weapon, ray_aabb_intersection,
-    AssaultRifle, BlockFigure, Bounds, Camera, CharacterBody, CharacterController, Engine,
-    Game, Input, OtsCameraConfig, Vec3, Weapon, compute_ots_camera,
+    compute_muzzle_world, AssaultRifle, BlockFigure, Bounds, Camera, CharacterBody,
+    CharacterController, Engine, Game, Input, OtsCameraConfig, ProjectileConfig,
+    ProjectileManager, Vec3, Weapon, compute_ots_camera,
 };
 
 const LIME_GREEN: u32 = 0x00FF00;
@@ -25,8 +26,10 @@ struct MyGame {
     camera_config: OtsCameraConfig,
     camera_pitch: f32,
     aim_pitch: f32,
+    aim_point: Option<Vec3>,
     model: BlockFigure,
     rifle: AssaultRifle,
+    projectiles: ProjectileManager,
     vertices: [Vec3; 8],
     edges: [(usize, usize); 12],
     bounds: Bounds,
@@ -88,6 +91,15 @@ impl MyGame {
         let room_min = Vec3::new(-hw, -hh, -hd);
         let room_max = Vec3::new(hw, hh, hd);
 
+        let projectiles = ProjectileManager::new(ProjectileConfig {
+            speed: 1.5,
+            color: 0xFF0000,
+            length: 0.8,
+            splash_color: 0xFFFF00,
+            splash_duration: 30,
+            splash_size: 0.5,
+        });
+
         MyGame {
             camera,
             body,
@@ -95,8 +107,10 @@ impl MyGame {
             camera_config,
             camera_pitch: 0.15,
             aim_pitch: 0.0,
+            aim_point: None,
             model: BlockFigure::new(0xFFFFFF),
             rifle: AssaultRifle::new(0xFFFFFF),
+            projectiles,
             vertices,
             edges,
             bounds,
@@ -130,7 +144,7 @@ impl Game for MyGame {
             &mut self.camera,
         );
 
-        // Compute aim pitch: cast ray from camera through screen center to find aim point
+        // Compute aim pitch and aim point
         let ray_origin = self.camera.position;
         let ray_dir = self.camera.direction();
 
@@ -138,25 +152,42 @@ impl Game for MyGame {
         let upper_leg_len = self.body.height * 0.22;
         let hip_drop = upper_leg_len * crouch_factor;
         let shoulder_y = self.body.height * 0.78 - hip_drop;
+        let hip_y = self.body.height * 0.45 - hip_drop;
+        let character_yaw_offset = -std::f32::consts::FRAC_PI_2;
 
-        if let Some(aim_world) = ray_aabb_intersection(ray_origin, ray_dir, self.room_min, self.room_max) {
-            // Convert aim point to character-local space (undo yaw + yaw_offset rotation and translation)
-            let character_yaw_offset = -std::f32::consts::FRAC_PI_2;
+        self.aim_point = ray_aabb_intersection(ray_origin, ray_dir, self.room_min, self.room_max);
+
+        if let Some(aim_world) = self.aim_point {
             let rotation = self.body.yaw + character_yaw_offset;
             let relative = aim_world.sub(self.body.position);
             let local_aim = relative.rotate_y(-rotation);
 
-            // Get muzzle position in local space (before pitch)
             let muzzle = self.rifle.muzzle_position(self.body.height, shoulder_y);
 
-            // Compute pitch from muzzle to aim point in the YZ plane
             let dz = local_aim.z - muzzle.z;
             let dy = local_aim.y - muzzle.y;
-            let forward_dist = dz; // forward distance in local Z
-            if forward_dist.abs() > 0.01 {
-                self.aim_pitch = -(dy / forward_dist).atan();
+            if dz.abs() > 0.01 {
+                self.aim_pitch = -(dy / dz).atan();
             }
         }
+
+        // Fire projectile on left click
+        if input.mouse_left_click {
+            if let Some(aim_world) = self.aim_point {
+                let muzzle_world = compute_muzzle_world(
+                    &self.body,
+                    &self.rifle,
+                    shoulder_y,
+                    hip_y,
+                    character_yaw_offset,
+                    self.aim_pitch,
+                );
+                self.projectiles.fire(muzzle_world, aim_world);
+            }
+        }
+
+        // Update projectiles
+        self.projectiles.update(self.room_min, self.room_max);
     }
 
     fn render(&mut self, buffer: &mut Vec<u32>, width: usize, height: usize) {
@@ -176,7 +207,7 @@ impl Game for MyGame {
         let character_yaw_offset = -std::f32::consts::FRAC_PI_2;
         let arm_pose = self.rifle.arm_pose();
 
-        // Draw character model with upper body pitch and walk animation
+        // Draw character model
         draw_character(
             buffer,
             width,
@@ -191,7 +222,7 @@ impl Game for MyGame {
             &self.model,
         );
 
-        // Draw weapon with upper body pitch
+        // Draw weapon
         let crouch_factor = self.controller.crouch_factor();
         let upper_leg_len = self.body.height * 0.22;
         let hip_drop = upper_leg_len * crouch_factor;
@@ -209,6 +240,9 @@ impl Game for MyGame {
             self.aim_pitch,
             &self.rifle,
         );
+
+        // Draw projectiles
+        self.projectiles.draw(buffer, width, height, &self.camera);
 
         // Crosshair
         draw_crosshair(buffer, width, height, 10, 0xFFFFFF);
