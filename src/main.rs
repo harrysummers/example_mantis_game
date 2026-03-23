@@ -141,8 +141,6 @@ impl Game for MyGame {
         }
 
         // Draw character model
-        let eff_height = self.controller.effective_height(self.body.height);
-        // Align model's local +Z (front) with the movement direction (+X at yaw=0)
         let character_yaw_offset = -std::f32::consts::FRAC_PI_2;
         draw_character(
             buffer,
@@ -150,7 +148,7 @@ impl Game for MyGame {
             height,
             &self.camera,
             &self.body,
-            eff_height,
+            self.controller.crouch_factor(),
             character_yaw_offset,
             &self.model,
         );
