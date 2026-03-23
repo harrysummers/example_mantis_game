@@ -35,6 +35,13 @@ const CRATE_HEIGHT: f32 = 2.4; // tall enough to hide crouching body, head visib
 const CRATE_COLOR: u32 = 0x4A2A12; // dark opaque brown
 const NUM_CRATES: usize = 2;
 
+const HEALTH_PICKUP_AMOUNT: i32 = 100;
+const HEALTH_SPAWN_MIN: u32 = 30 * 60; // 30 seconds
+const HEALTH_SPAWN_MAX: u32 = 60 * 60; // 60 seconds
+const HEALTH_PICKUP_RADIUS: f32 = 1.0;
+const HEAL_FLASH_FRAMES: u32 = 10;
+const GREEN: u32 = 0x00FF00;
+
 const RESPAWN_FRAMES: u32 = 120; // ~2 seconds at 60fps
 const AI_MIN_FRAMES: u32 = 12;  // 0.2s at 60fps
 const AI_MAX_FRAMES: u32 = 120; // 2.0s at 60fps
@@ -74,6 +81,7 @@ struct Enemy {
     turn_rate: f32,
     aim_pitch: f32,
     ammo: AmmoState,
+    heal_flash: u32,
 }
 
 impl Enemy {
@@ -114,6 +122,12 @@ impl Enemy {
     }
 }
 
+struct HealthPickup {
+    position: Vec3,
+    active: bool,
+    rotation: f32, // current spin angle
+}
+
 struct MyGame {
     camera: Camera,
     body: CharacterBody,
@@ -151,6 +165,9 @@ struct MyGame {
     hit_model: BlockFigure,
     zbuf: Vec<f32>,
     crates: Vec<Crate>,
+    health_pickup: HealthPickup,
+    health_spawn_timer: u32,
+    player_heal_flash: u32,
 }
 
 impl MyGame {
@@ -267,6 +284,13 @@ impl MyGame {
             hit_model: BlockFigure::new(0xFF0000),
             zbuf: Vec::new(),
             crates: Vec::new(),
+            health_pickup: HealthPickup {
+                position: Vec3::new(0.0, 0.0, 0.0),
+                active: false,
+                rotation: 0.0,
+            },
+            health_spawn_timer: 0,
+            player_heal_flash: 0,
         }
     }
     fn start_game(&mut self) {
@@ -320,8 +344,13 @@ impl MyGame {
                 action: EnemyAction { shooting: false, crouching: false, walking: false, sprinting: false, turning: false },
                 action_timer: 30, turn_rate: 0.0, aim_pitch: 0.0,
                 ammo: AmmoState::new(enemy_rifle_ref.magazine_size(), enemy_rifle_ref.reload_time()),
+                heal_flash: 0,
             });
         }
+
+        // Spawn first health pickup immediately
+        self.health_spawn_timer = 0;
+        self.health_pickup.active = false;
 
         self.started = true;
         self.countdown = COUNTDOWN_FRAMES;
@@ -636,6 +665,60 @@ impl Game for MyGame {
             self.bounds.clamp(&mut enemy.body.position);
         }
 
+        // Tick heal flashes
+        if self.player_heal_flash > 0 { self.player_heal_flash -= 1; }
+        for enemy in &mut self.enemies {
+            if enemy.heal_flash > 0 { enemy.heal_flash -= 1; }
+        }
+
+        // Health pickup spawning and collection
+        if !self.health_pickup.active {
+            if self.health_spawn_timer > 0 {
+                self.health_spawn_timer -= 1;
+            } else {
+                // Spawn health pickup at random location
+                let margin = 3.0;
+                let hw = ROOM_W / 2.0 - margin;
+                let hd = ROOM_D / 2.0 - margin;
+                let floor_y = -ROOM_H / 2.0;
+                let rx = self.rand_f32() * 2.0 - 1.0;
+                let rz = self.rand_f32() * 2.0 - 1.0;
+                self.health_pickup.position = Vec3::new(rx * hw, floor_y + 1.5, rz * hd);
+                self.health_pickup.active = true;
+                self.health_pickup.rotation = 0.0;
+            }
+        }
+
+        if self.health_pickup.active {
+            self.health_pickup.rotation += 0.03; // slow spin
+
+            // Check player pickup
+            let dx = self.body.position.x - self.health_pickup.position.x;
+            let dz = self.body.position.z - self.health_pickup.position.z;
+            if (dx * dx + dz * dz).sqrt() < HEALTH_PICKUP_RADIUS {
+                self.player_hp = (self.player_hp + HEALTH_PICKUP_AMOUNT).min(self.player_max_hp);
+                self.player_heal_flash = HEAL_FLASH_FRAMES;
+                self.health_pickup.active = false;
+                self.health_spawn_timer = HEALTH_SPAWN_MIN + (self.rand_f32() * (HEALTH_SPAWN_MAX - HEALTH_SPAWN_MIN) as f32) as u32;
+            }
+
+            // Check enemy pickup
+            if self.health_pickup.active {
+                for enemy in &mut self.enemies {
+                    if !enemy.alive { continue; }
+                    let dx = enemy.body.position.x - self.health_pickup.position.x;
+                    let dz = enemy.body.position.z - self.health_pickup.position.z;
+                    if (dx * dx + dz * dz).sqrt() < HEALTH_PICKUP_RADIUS {
+                        enemy.hp = (enemy.hp + HEALTH_PICKUP_AMOUNT).min(enemy.max_hp);
+                        enemy.heal_flash = HEAL_FLASH_FRAMES;
+                        self.health_pickup.active = false;
+                        self.health_spawn_timer = HEALTH_SPAWN_MIN + (self.rand_f32() * (HEALTH_SPAWN_MAX - HEALTH_SPAWN_MIN) as f32) as u32;
+                        break;
+                    }
+                }
+            }
+        }
+
         let eff_height = self.controller.effective_height(self.body.height);
         compute_ots_camera_bounded(
             &self.body,
@@ -811,6 +894,7 @@ impl Game for MyGame {
                     enemy.turn_rate = 0.0;
                     enemy.aim_pitch = 0.0;
                     enemy.ammo = AmmoState::new(self.enemy_rifle.magazine_size(), self.enemy_rifle.reload_time());
+                    enemy.heal_flash = 0;
                 }
             }
         }
@@ -861,6 +945,41 @@ impl Game for MyGame {
             draw_filled_quad_3d(buffer, &mut self.zbuf, width, height, &self.camera, c[1], c[5], c[6], c[2], CRATE_COLOR);
         }
 
+        // Health pickup (spinning solid green heart)
+        if self.health_pickup.active {
+            let hp = self.health_pickup.position;
+            let rot = self.health_pickup.rotation;
+            let size = 0.4;
+            let num_pts = 24;
+            // Heart shape in 2D (local X, Y)
+            let heart_points: Vec<(f32, f32)> = (0..=num_pts).map(|i| {
+                let t = std::f32::consts::TAU * i as f32 / num_pts as f32;
+                let x = size * t.sin().powi(3);
+                let y = size * (13.0 * t.cos() - 5.0 * (2.0 * t).cos() - 2.0 * (3.0 * t).cos() - (4.0 * t).cos()) / 16.0;
+                (x, y)
+            }).collect();
+
+            // Draw two filled heart planes (0 and 90 degrees) as triangle fans
+            let cos_r = rot.cos();
+            let sin_r = rot.sin();
+            for offset in [0.0f32, std::f32::consts::FRAC_PI_2] {
+                let cr = (rot + offset).cos();
+                let sr = (rot + offset).sin();
+                let center = hp;
+                for i in 0..num_pts {
+                    let (x0, y0) = heart_points[i];
+                    let (x1, y1) = heart_points[i + 1];
+                    let v0 = Vec3::new(hp.x + x0 * cr, hp.y + y0, hp.z + x0 * sr);
+                    let v1 = Vec3::new(hp.x + x1 * cr, hp.y + y1, hp.z + x1 * sr);
+                    // Filled triangle from center to edge
+                    draw_filled_quad_3d(buffer, &mut self.zbuf, width, height, &self.camera,
+                        center, v0, v1, center, GREEN);
+                    // Outline edge
+                    draw_line_3d(buffer, width, height, &self.camera, v0, v1, 0x00AA00);
+                }
+            }
+        }
+
         // Player filled
         let mut arm_pose = self.rifle.arm_pose();
         let weapon_pitch = if self.ammo.reloading {
@@ -869,7 +988,7 @@ impl Game for MyGame {
             self.aim_pitch
         };
 
-        let player_fill = if self.hit_flash > 0 { 0xFF0000 } else { 0xFFFFFF };
+        let player_fill = if self.hit_flash > 0 { 0xFF0000 } else if self.player_heal_flash > 0 { GREEN } else { 0xFFFFFF };
         draw_character_filled(
             buffer, &mut self.zbuf, width, height, &self.camera,
             &self.body, self.controller.crouch_factor(), character_yaw_offset,
@@ -895,11 +1014,12 @@ impl Game for MyGame {
             let e_crouch = enemy.controller.crouch_factor();
             let e_walk = enemy.controller.walk_cycle();
 
+            let enemy_fill = if enemy.heal_flash > 0 { GREEN } else { 0x111111 };
             draw_character_filled(
                 buffer, &mut self.zbuf, width, height, &self.camera,
                 &enemy.body, e_crouch, character_yaw_offset,
                 Some(&enemy_arm_pose), enemy.aim_pitch, e_walk,
-                &self.enemy_model, 0x111111,
+                &self.enemy_model, enemy_fill,
             );
 
             let e_upper_leg = enemy.body.height * 0.22;
