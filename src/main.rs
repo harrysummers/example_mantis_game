@@ -30,9 +30,28 @@ const HIT_FLASH_FRAMES: u32 = 10;
 const COUNTDOWN_SECONDS: u32 = 3;
 const COUNTDOWN_FRAMES: u32 = COUNTDOWN_SECONDS * 60;
 
+const CRATE_SIZE: f32 = 1.5; // half-extent of cube crate
+const CRATE_HEIGHT: f32 = 2.4; // tall enough to hide crouching body, head visible when standing
+const CRATE_COLOR: u32 = 0x4A2A12; // dark opaque brown
+const NUM_CRATES: usize = 2;
+
 const RESPAWN_FRAMES: u32 = 120; // ~2 seconds at 60fps
 const AI_MIN_FRAMES: u32 = 12;  // 0.2s at 60fps
 const AI_MAX_FRAMES: u32 = 120; // 2.0s at 60fps
+
+#[derive(Clone, Copy)]
+struct Crate {
+    position: Vec3, // center of base on the floor
+}
+
+impl Crate {
+    fn aabb(&self) -> (Vec3, Vec3) {
+        (
+            Vec3::new(self.position.x - CRATE_SIZE, self.position.y, self.position.z - CRATE_SIZE),
+            Vec3::new(self.position.x + CRATE_SIZE, self.position.y + CRATE_HEIGHT, self.position.z + CRATE_SIZE),
+        )
+    }
+}
 
 #[derive(Clone, Copy)]
 struct EnemyAction {
@@ -131,6 +150,7 @@ struct MyGame {
     countdown: u32,
     hit_model: BlockFigure,
     zbuf: Vec<f32>,
+    crates: Vec<Crate>,
 }
 
 impl MyGame {
@@ -246,6 +266,7 @@ impl MyGame {
             countdown: 0,
             hit_model: BlockFigure::new(0xFF0000),
             zbuf: Vec::new(),
+            crates: Vec::new(),
         }
     }
     fn start_game(&mut self) {
@@ -253,6 +274,36 @@ impl MyGame {
         let margin = 2.0;
         let spawn_hw = ROOM_W / 2.0 - margin;
         let spawn_hd = ROOM_D / 2.0 - margin;
+
+        // Spawn crates (non-overlapping, away from player spawn)
+        self.crates.clear();
+        for _ in 0..NUM_CRATES {
+            loop {
+                let rx = self.rand_f32() * 2.0 - 1.0;
+                let rz = self.rand_f32() * 2.0 - 1.0;
+                let pos = Vec3::new(rx * (spawn_hw - CRATE_SIZE), floor_y, rz * (spawn_hd - CRATE_SIZE));
+
+                // Check not too close to player spawn (0,0)
+                let dist_player = (pos.x * pos.x + pos.z * pos.z).sqrt();
+                if dist_player < 5.0 { continue; }
+
+                // Check not overlapping other crates
+                let mut overlaps = false;
+                for existing in &self.crates {
+                    let dx = (pos.x - existing.position.x).abs();
+                    let dz = (pos.z - existing.position.z).abs();
+                    if dx < CRATE_SIZE * 3.0 && dz < CRATE_SIZE * 3.0 {
+                        overlaps = true;
+                        break;
+                    }
+                }
+                if overlaps { continue; }
+
+                self.crates.push(Crate { position: pos });
+                break;
+            }
+        }
+
         let enemy_rifle_ref = AssaultRifle::new(ORANGE);
 
         for _ in 0..2 {
@@ -380,7 +431,11 @@ impl Game for MyGame {
         let player_pos = self.body.position;
         let player_eff_h = self.controller.effective_height(self.body.height);
         let player_center = Vec3::new(player_pos.x, player_pos.y + player_eff_h * 0.5, player_pos.z);
+        let player_head = Vec3::new(player_pos.x, player_pos.y + player_eff_h * 0.92, player_pos.z);
         let character_yaw_offset = -std::f32::consts::FRAC_PI_2;
+
+        // Precompute crate AABBs for line-of-sight checks
+        let crate_aabbs: Vec<(Vec3, Vec3)> = self.crates.iter().map(|c| c.aabb()).collect();
 
         // Update enemy AI
         let mut new_actions: Vec<Option<(EnemyAction, u32, f32)>> = Vec::new();
@@ -413,7 +468,7 @@ impl Game for MyGame {
 
             let act = enemy.action;
 
-            // Shooting: face player, aim, fire
+            // Shooting: face player, check line-of-sight through crates, aim, fire
             if act.shooting {
                 let dx = player_center.x - enemy.body.position.x;
                 let dz = player_center.z - enemy.body.position.z;
@@ -425,24 +480,64 @@ impl Game for MyGame {
                 let e_shoulder_y = enemy.body.height * 0.78 - e_hip_drop;
                 let e_hip_y = enemy.body.height * 0.45 - e_hip_drop;
 
-                let rotation = enemy.body.yaw + character_yaw_offset;
-                let relative = player_center.sub(enemy.body.position);
-                let local_aim = relative.rotate_y(-rotation);
-                let muzzle_local = self.enemy_rifle.muzzle_position(enemy.body.height, e_shoulder_y);
-                let dz_aim = local_aim.z - muzzle_local.z;
-                let dy_aim = local_aim.y - muzzle_local.y;
-                if dz_aim.abs() > 0.01 {
-                    enemy.aim_pitch = -(dy_aim / dz_aim).atan();
-                }
+                // Check line-of-sight: try body center first, then head
+                let eye_pos = Vec3::new(
+                    enemy.body.position.x,
+                    enemy.body.position.y + enemy.controller.effective_height(enemy.body.height) * 0.8,
+                    enemy.body.position.z,
+                );
 
-                if enemy.ammo.can_fire() {
-                    let muzzle_world = compute_muzzle_world(
-                        &enemy.body, &self.enemy_rifle,
-                        e_shoulder_y, e_hip_y,
-                        character_yaw_offset, enemy.aim_pitch,
-                    );
-                    self.enemy_projectiles.fire(muzzle_world, player_center);
-                    enemy.ammo.fire(self.enemy_rifle.fire_interval());
+                let can_see = |target: Vec3| -> bool {
+                    let dir = target.sub(eye_pos);
+                    let dist_sq = dir.x * dir.x + dir.y * dir.y + dir.z * dir.z;
+                    let dist = dist_sq.sqrt();
+                    if dist < 0.01 { return true; }
+                    let dir_n = dir.scale(1.0 / dist);
+                    for (cmin, cmax) in &crate_aabbs {
+                        if let Some(hit) = ray_aabb_intersection(eye_pos, dir_n, *cmin, *cmax) {
+                            let hit_dist = {
+                                let d = hit.sub(eye_pos);
+                                (d.x * d.x + d.y * d.y + d.z * d.z).sqrt()
+                            };
+                            if hit_dist < dist {
+                                return false; // crate is between enemy and target
+                            }
+                        }
+                    }
+                    true
+                };
+
+                // Pick best visible target
+                let aim_target = if can_see(player_center) {
+                    Some(player_center)
+                } else if can_see(player_head) {
+                    Some(player_head)
+                } else {
+                    None
+                };
+
+                if let Some(target) = aim_target {
+                    let rotation = enemy.body.yaw + character_yaw_offset;
+                    let relative = target.sub(enemy.body.position);
+                    let local_aim = relative.rotate_y(-rotation);
+                    let muzzle_local = self.enemy_rifle.muzzle_position(enemy.body.height, e_shoulder_y);
+                    let dz_aim = local_aim.z - muzzle_local.z;
+                    let dy_aim = local_aim.y - muzzle_local.y;
+                    if dz_aim.abs() > 0.01 {
+                        enemy.aim_pitch = -(dy_aim / dz_aim).atan();
+                    }
+
+                    if enemy.ammo.can_fire() {
+                        let muzzle_world = compute_muzzle_world(
+                            &enemy.body, &self.enemy_rifle,
+                            e_shoulder_y, e_hip_y,
+                            character_yaw_offset, enemy.aim_pitch,
+                        );
+                        self.enemy_projectiles.fire(muzzle_world, target);
+                        enemy.ammo.fire(self.enemy_rifle.fire_interval());
+                    }
+                } else {
+                    enemy.aim_pitch = 0.0; // can't see player, don't fire
                 }
             } else {
                 enemy.aim_pitch = 0.0;
@@ -508,6 +603,33 @@ impl Game for MyGame {
                 }
             }
         }
+        // Character-to-crate collision (push characters out of crate AABBs)
+        for cr in &self.crates {
+            let (cmin, cmax) = cr.aabb();
+            // Helper: push a body out of a crate AABB
+            let mut push_out = |pos: &mut Vec3| {
+                let char_r = collision_radius;
+                if pos.x + char_r > cmin.x && pos.x - char_r < cmax.x
+                    && pos.z + char_r > cmin.z && pos.z - char_r < cmax.z
+                {
+                    // Find smallest push-out axis (X or Z)
+                    let push_xp = cmax.x + char_r - pos.x;
+                    let push_xn = pos.x - (cmin.x - char_r);
+                    let push_zp = cmax.z + char_r - pos.z;
+                    let push_zn = pos.z - (cmin.z - char_r);
+                    let min_push = push_xp.min(push_xn).min(push_zp).min(push_zn);
+                    if min_push == push_xp { pos.x = cmax.x + char_r; }
+                    else if min_push == push_xn { pos.x = cmin.x - char_r; }
+                    else if min_push == push_zp { pos.z = cmax.z + char_r; }
+                    else { pos.z = cmin.z - char_r; }
+                }
+            };
+            push_out(&mut self.body.position);
+            for enemy in &mut self.enemies {
+                if enemy.alive { push_out(&mut enemy.body.position); }
+            }
+        }
+
         // Re-clamp all after separation
         self.bounds.clamp(&mut self.body.position);
         for enemy in &mut self.enemies {
@@ -599,6 +721,10 @@ impl Game for MyGame {
         // Update projectiles
         self.projectiles.update(self.room_min, self.room_max);
 
+        // Projectiles vs crates (player projectiles)
+        let crate_targets: Vec<(Vec3, Vec3)> = self.crates.iter().map(|c| c.aabb()).collect();
+        self.projectiles.check_hits(&crate_targets); // just kill them, no damage
+
         // Check headshots first, then body shots
         let dead_aabb = |e: &Enemy| { let p = e.body.position; (p, p) };
 
@@ -638,6 +764,7 @@ impl Game for MyGame {
 
         // Update enemy projectiles and check hits against player
         self.enemy_projectiles.update(self.room_min, self.room_max);
+        self.enemy_projectiles.check_hits(&crate_targets); // enemy bullets stop on crates too
         {
             let player_hw = self.body.height * 0.18;
             let player_h = self.controller.effective_height(self.body.height);
@@ -716,6 +843,24 @@ impl Game for MyGame {
         draw_filled_quad_3d(buffer, &mut self.zbuf, width, height, &self.camera,
             v[1], v[5], v[6], v[2], 0x888888); // wall +X
 
+        // Crates (filled + wireframe edges)
+        for cr in &self.crates {
+            let (cmin, cmax) = cr.aabb();
+            let c = [
+                Vec3::new(cmin.x, cmin.y, cmin.z), Vec3::new(cmax.x, cmin.y, cmin.z),
+                Vec3::new(cmax.x, cmax.y, cmin.z), Vec3::new(cmin.x, cmax.y, cmin.z),
+                Vec3::new(cmin.x, cmin.y, cmax.z), Vec3::new(cmax.x, cmin.y, cmax.z),
+                Vec3::new(cmax.x, cmax.y, cmax.z), Vec3::new(cmin.x, cmax.y, cmax.z),
+            ];
+            // Filled faces
+            draw_filled_quad_3d(buffer, &mut self.zbuf, width, height, &self.camera, c[0], c[1], c[2], c[3], CRATE_COLOR);
+            draw_filled_quad_3d(buffer, &mut self.zbuf, width, height, &self.camera, c[5], c[4], c[7], c[6], CRATE_COLOR);
+            draw_filled_quad_3d(buffer, &mut self.zbuf, width, height, &self.camera, c[3], c[2], c[6], c[7], CRATE_COLOR);
+            draw_filled_quad_3d(buffer, &mut self.zbuf, width, height, &self.camera, c[4], c[5], c[1], c[0], CRATE_COLOR);
+            draw_filled_quad_3d(buffer, &mut self.zbuf, width, height, &self.camera, c[4], c[0], c[3], c[7], CRATE_COLOR);
+            draw_filled_quad_3d(buffer, &mut self.zbuf, width, height, &self.camera, c[1], c[5], c[6], c[2], CRATE_COLOR);
+        }
+
         // Player filled
         let mut arm_pose = self.rifle.arm_pose();
         let weapon_pitch = if self.ammo.reloading {
@@ -771,18 +916,7 @@ impl Game for MyGame {
 
         // === WIREFRAME (on top, no z-test) ===
 
-        // Player wireframe
-        let player_model = if self.hit_flash > 0 { &self.hit_model } else { &self.model };
-        draw_character(
-            buffer, width, height, &self.camera,
-            &self.body, self.controller.crouch_factor(), character_yaw_offset,
-            Some(&arm_pose), self.aim_pitch, self.controller.walk_cycle(),
-            player_model,
-        );
-        draw_weapon(
-            buffer, width, height, &self.camera,
-            &self.body, shoulder_y, hip_y, character_yaw_offset, weapon_pitch, &self.rifle,
-        );
+        // (Player wireframe removed — solid fill only)
 
         // Enemy health bars
         for enemy in &self.enemies {
