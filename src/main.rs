@@ -176,7 +176,7 @@ impl Game for MyGame {
         let character_yaw_offset = -std::f32::consts::FRAC_PI_2;
         let arm_pose = self.rifle.arm_pose();
 
-        // Draw character model with upper body pitch
+        // Draw character model with upper body pitch and walk animation
         draw_character(
             buffer,
             width,
@@ -187,6 +187,7 @@ impl Game for MyGame {
             character_yaw_offset,
             Some(&arm_pose),
             self.aim_pitch,
+            self.controller.walk_cycle(),
             &self.model,
         );
 
