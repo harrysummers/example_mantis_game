@@ -6,6 +6,7 @@ const MOVE_SPEED: f32 = 0.15;
 const SPRINT_MULTIPLIER: f32 = 2.0;
 const JUMP_FORCE: f32 = 0.3;
 const GRAVITY: f32 = 0.015;
+const CROUCH_OFFSET: f32 = 1.5;
 
 // Room dimensions
 const ROOM_W: f32 = 40.0;
@@ -49,7 +50,7 @@ impl MyGame {
         ];
 
         let camera = Camera::new(Vec3::new(0.0, 0.0, 0.0), aspect);
-        let controller = CharacterController::new(MOVE_SPEED, SPRINT_MULTIPLIER, JUMP_FORCE, GRAVITY, 0.0);
+        let controller = CharacterController::new(MOVE_SPEED, SPRINT_MULTIPLIER, JUMP_FORCE, GRAVITY, CROUCH_OFFSET, 0.0);
 
         // Keep player inside the room with a small margin from the walls
         let margin = 0.5;
