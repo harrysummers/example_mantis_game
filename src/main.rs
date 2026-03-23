@@ -3,7 +3,7 @@ use mantis::{
     draw_line, draw_line_3d, draw_text, draw_weapon, draw_weapon_filled,
     ray_aabb_intersection, text_width, text_height, compute_muzzle_world, AmmoState, AssaultRifle,
     BlockFigure, Bounds, Camera, CharacterBody, CharacterController, Engine, Game, Input,
-    OtsCameraConfig, ProjectileConfig, ProjectileManager, Vec3, Weapon, compute_ots_camera,
+    OtsCameraConfig, ProjectileConfig, ProjectileManager, Vec3, Weapon, compute_ots_camera_bounded,
 };
 
 const LIME_GREEN: u32 = 0x00FF00;
@@ -352,9 +352,10 @@ impl Game for MyGame {
                 self.camera_config.pitch_max,
             );
             let eff_height = self.controller.effective_height(self.body.height);
-            compute_ots_camera(
+            compute_ots_camera_bounded(
                 &self.body, eff_height, self.camera_pitch,
                 &self.camera_config, &mut self.camera,
+                Some(self.room_min), Some(self.room_max),
             );
             return;
         }
@@ -468,13 +469,60 @@ impl Game for MyGame {
             self.bounds.clamp(&mut enemy.body.position);
         }
 
+        // Character-to-character collision separation
+        let collision_radius = CHARACTER_HEIGHT * 0.2;
+        // Player vs enemies
+        for enemy in &mut self.enemies {
+            if !enemy.alive { continue; }
+            let dx = self.body.position.x - enemy.body.position.x;
+            let dz = self.body.position.z - enemy.body.position.z;
+            let dist = (dx * dx + dz * dz).sqrt();
+            let min_dist = collision_radius * 2.0;
+            if dist < min_dist && dist > 0.001 {
+                let overlap = (min_dist - dist) * 0.5;
+                let nx = dx / dist;
+                let nz = dz / dist;
+                self.body.position.x += nx * overlap;
+                self.body.position.z += nz * overlap;
+                enemy.body.position.x -= nx * overlap;
+                enemy.body.position.z -= nz * overlap;
+            }
+        }
+        // Enemy vs enemy
+        let enemy_count = self.enemies.len();
+        for i in 0..enemy_count {
+            for j in (i + 1)..enemy_count {
+                if !self.enemies[i].alive || !self.enemies[j].alive { continue; }
+                let dx = self.enemies[i].body.position.x - self.enemies[j].body.position.x;
+                let dz = self.enemies[i].body.position.z - self.enemies[j].body.position.z;
+                let dist = (dx * dx + dz * dz).sqrt();
+                let min_dist = collision_radius * 2.0;
+                if dist < min_dist && dist > 0.001 {
+                    let overlap = (min_dist - dist) * 0.5;
+                    let nx = dx / dist;
+                    let nz = dz / dist;
+                    self.enemies[i].body.position.x += nx * overlap;
+                    self.enemies[i].body.position.z += nz * overlap;
+                    self.enemies[j].body.position.x -= nx * overlap;
+                    self.enemies[j].body.position.z -= nz * overlap;
+                }
+            }
+        }
+        // Re-clamp all after separation
+        self.bounds.clamp(&mut self.body.position);
+        for enemy in &mut self.enemies {
+            self.bounds.clamp(&mut enemy.body.position);
+        }
+
         let eff_height = self.controller.effective_height(self.body.height);
-        compute_ots_camera(
+        compute_ots_camera_bounded(
             &self.body,
             eff_height,
             self.camera_pitch,
             &self.camera_config,
             &mut self.camera,
+            Some(self.room_min),
+            Some(self.room_max),
         );
 
         // Compute aim pitch and aim point
