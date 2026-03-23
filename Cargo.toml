@@ -1,0 +1,8 @@
+[package]
+name = "example_mantis_game"
+version = "0.1.0"
+edition = "2021"
+description = "An example game built with the Mantis engine"
+
+[dependencies]
+mantis = { path = "../mantis" }
