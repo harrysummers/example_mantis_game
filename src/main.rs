@@ -1,5 +1,6 @@
 use mantis::{
-    draw_button, draw_character, draw_crosshair, draw_line, draw_line_3d, draw_text, draw_weapon,
+    draw_button, draw_character, draw_character_filled, draw_crosshair, draw_filled_quad_3d,
+    draw_line, draw_line_3d, draw_text, draw_weapon, draw_weapon_filled,
     ray_aabb_intersection, text_width, text_height, compute_muzzle_world, AmmoState, AssaultRifle,
     BlockFigure, Bounds, Camera, CharacterBody, CharacterController, Engine, Game, Input,
     OtsCameraConfig, ProjectileConfig, ProjectileManager, Vec3, Weapon, compute_ots_camera,
@@ -128,6 +129,7 @@ struct MyGame {
     last_mouse_click: bool,
     countdown: u32,
     hit_model: BlockFigure,
+    zbuf: Vec<f32>,
 }
 
 impl MyGame {
@@ -267,6 +269,7 @@ impl MyGame {
             last_mouse_click: false,
             countdown: COUNTDOWN_FRAMES,
             hit_model: BlockFigure::new(0xFF0000),
+            zbuf: Vec::new(),
         }
     }
     fn reset(&mut self) {
@@ -628,90 +631,103 @@ impl Game for MyGame {
     }
 
     fn render(&mut self, buffer: &mut Vec<u32>, width: usize, height: usize) {
-        // Draw room wireframe
-        for &(a, b) in &self.edges {
-            draw_line_3d(
-                buffer,
-                width,
-                height,
-                &self.camera,
-                self.vertices[a],
-                self.vertices[b],
-                LIME_GREEN,
-            );
+        // Initialize/clear z-buffer
+        let buf_size = width * height;
+        if self.zbuf.len() != buf_size {
+            self.zbuf.resize(buf_size, 0.0f32);
         }
+        self.zbuf.fill(0.0f32);
 
         let character_yaw_offset = -std::f32::consts::FRAC_PI_2;
-        let mut arm_pose = self.rifle.arm_pose();
 
-        // Apply reload animation: right arm bobs up and down twice
+        // === FILLED SURFACES (z-buffered) ===
+
+        // Room surfaces
+        let v = &self.vertices;
+        draw_filled_quad_3d(buffer, &mut self.zbuf, width, height, &self.camera,
+            v[0], v[1], v[5], v[4], 0xC4A46C); // floor (light brown)
+        draw_filled_quad_3d(buffer, &mut self.zbuf, width, height, &self.camera,
+            v[3], v[2], v[6], v[7], 0x555555); // ceiling (dark gray)
+        draw_filled_quad_3d(buffer, &mut self.zbuf, width, height, &self.camera,
+            v[0], v[1], v[2], v[3], 0x888888); // wall -Z
+        draw_filled_quad_3d(buffer, &mut self.zbuf, width, height, &self.camera,
+            v[5], v[4], v[7], v[6], 0x888888); // wall +Z
+        draw_filled_quad_3d(buffer, &mut self.zbuf, width, height, &self.camera,
+            v[4], v[0], v[3], v[7], 0x888888); // wall -X
+        draw_filled_quad_3d(buffer, &mut self.zbuf, width, height, &self.camera,
+            v[1], v[5], v[6], v[2], 0x888888); // wall +X
+
+        // Player filled
+        let mut arm_pose = self.rifle.arm_pose();
         if self.ammo.reloading {
             let t = self.ammo.reload_progress();
             let offset = (t * 2.0 * std::f32::consts::PI).sin().abs() * 0.4;
             arm_pose.right_upper_pitch -= offset;
         }
 
-        // Draw character model (red when hit)
-        let player_model = if self.hit_flash > 0 { &self.hit_model } else { &self.model };
-        draw_character(
-            buffer,
-            width,
-            height,
-            &self.camera,
-            &self.body,
-            self.controller.crouch_factor(),
-            character_yaw_offset,
-            Some(&arm_pose),
-            self.aim_pitch,
-            self.controller.walk_cycle(),
-            player_model,
+        let player_fill = if self.hit_flash > 0 { 0xFF0000 } else { 0xFFFFFF };
+        draw_character_filled(
+            buffer, &mut self.zbuf, width, height, &self.camera,
+            &self.body, self.controller.crouch_factor(), character_yaw_offset,
+            Some(&arm_pose), self.aim_pitch, self.controller.walk_cycle(),
+            &self.model, player_fill,
         );
 
-        // Draw weapon
         let crouch_factor = self.controller.crouch_factor();
         let upper_leg_len = self.body.height * 0.22;
         let hip_drop = upper_leg_len * crouch_factor;
         let shoulder_y = self.body.height * 0.78 - hip_drop;
         let hip_y = self.body.height * 0.45 - hip_drop;
-        draw_weapon(
-            buffer,
-            width,
-            height,
-            &self.camera,
-            &self.body,
-            shoulder_y,
-            hip_y,
-            character_yaw_offset,
-            self.aim_pitch,
-            &self.rifle,
+        draw_weapon_filled(
+            buffer, &mut self.zbuf, width, height, &self.camera,
+            &self.body, shoulder_y, hip_y, character_yaw_offset, self.aim_pitch,
+            &self.rifle, 0x111111,
         );
 
-        // Draw enemies
+        // Enemy filled
         let enemy_arm_pose = self.enemy_rifle.arm_pose();
         for enemy in &self.enemies {
             if !enemy.alive { continue; }
-
             let e_crouch = enemy.controller.crouch_factor();
             let e_walk = enemy.controller.walk_cycle();
-            draw_character(
-                buffer, width, height, &self.camera,
+
+            draw_character_filled(
+                buffer, &mut self.zbuf, width, height, &self.camera,
                 &enemy.body, e_crouch, character_yaw_offset,
                 Some(&enemy_arm_pose), enemy.aim_pitch, e_walk,
-                &self.enemy_model,
+                &self.enemy_model, 0x111111,
             );
 
             let e_upper_leg = enemy.body.height * 0.22;
             let e_hip_drop = e_upper_leg * e_crouch;
             let e_shoulder_y = enemy.body.height * 0.78 - e_hip_drop;
             let e_hip_y = enemy.body.height * 0.45 - e_hip_drop;
-            draw_weapon(
-                buffer, width, height, &self.camera,
+            draw_weapon_filled(
+                buffer, &mut self.zbuf, width, height, &self.camera,
                 &enemy.body, e_shoulder_y, e_hip_y,
                 character_yaw_offset, enemy.aim_pitch,
-                &self.enemy_rifle,
+                &self.enemy_rifle, 0x111111,
             );
+        }
 
-            // Enemy health bar (world-space projected to screen)
+        // === WIREFRAME (on top, no z-test) ===
+
+        // Player wireframe
+        let player_model = if self.hit_flash > 0 { &self.hit_model } else { &self.model };
+        draw_character(
+            buffer, width, height, &self.camera,
+            &self.body, self.controller.crouch_factor(), character_yaw_offset,
+            Some(&arm_pose), self.aim_pitch, self.controller.walk_cycle(),
+            player_model,
+        );
+        draw_weapon(
+            buffer, width, height, &self.camera,
+            &self.body, shoulder_y, hip_y, character_yaw_offset, self.aim_pitch, &self.rifle,
+        );
+
+        // Enemy health bars
+        for enemy in &self.enemies {
+            if !enemy.alive { continue; }
             let bar_world = Vec3::new(
                 enemy.body.position.x,
                 enemy.body.position.y + enemy.body.height + 0.5,
@@ -724,11 +740,9 @@ impl Game for MyGame {
                 let by = sy as i32;
                 let fill = (enemy.hp as f32 / enemy.max_hp as f32 * bar_w as f32) as i32;
 
-                // Background
                 for dy in 0..bar_h {
                     draw_line(buffer, width, height, bx, by + dy, bx + bar_w, by + dy, 0x663300);
                 }
-                // Fill
                 if fill > 0 {
                     for dy in 0..bar_h {
                         draw_line(buffer, width, height, bx, by + dy, bx + fill, by + dy, ORANGE);
