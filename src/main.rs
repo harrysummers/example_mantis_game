@@ -122,6 +122,7 @@ struct MyGame {
     enemy_projectiles: ProjectileManager,
     hit_flash: u32,
     game_over: bool,
+    started: bool,
     cursor_shown: bool,
     aspect: f32,
     last_mouse_x: f32,
@@ -198,33 +199,7 @@ impl MyGame {
         let rifle = AssaultRifle::new(0xFFFFFF);
         let ammo = AmmoState::new(rifle.magazine_size(), rifle.reload_time());
 
-        let mut enemy1_body = CharacterBody::new(Vec3::new(-8.0, floor_y, -8.0), CHARACTER_HEIGHT);
-        enemy1_body.yaw = std::f32::consts::FRAC_PI_4; // face toward center
-        let mut enemy2_body = CharacterBody::new(Vec3::new(8.0, floor_y, 8.0), CHARACTER_HEIGHT);
-        enemy2_body.yaw = std::f32::consts::FRAC_PI_4 + std::f32::consts::PI;
-
-        let new_enemy_controller = || CharacterController::new(
-            MOVE_SPEED, SPRINT_MULTIPLIER, JUMP_FORCE, GRAVITY, CROUCH_OFFSET,
-        );
-        let enemy_rifle_ref = AssaultRifle::new(ORANGE);
-        let new_enemy_ammo = || AmmoState::new(enemy_rifle_ref.magazine_size(), enemy_rifle_ref.reload_time());
-
-        let enemies = vec![
-            Enemy {
-                body: enemy1_body, controller: new_enemy_controller(),
-                hp: ENEMY_HP, max_hp: ENEMY_HP, alive: true, death_timer: 0,
-                action: EnemyAction { shooting: false, crouching: false, walking: false, sprinting: false, turning: false },
-                action_timer: 30, turn_rate: 0.0,
-                aim_pitch: 0.0, ammo: new_enemy_ammo(),
-            },
-            Enemy {
-                body: enemy2_body, controller: new_enemy_controller(),
-                hp: ENEMY_HP, max_hp: ENEMY_HP, alive: true, death_timer: 0,
-                action: EnemyAction { shooting: false, crouching: false, walking: false, sprinting: false, turning: false },
-                action_timer: 60, turn_rate: 0.0,
-                aim_pitch: 0.0, ammo: new_enemy_ammo(),
-            },
-        ];
+        let enemies = Vec::new();
 
         let enemy_projectiles = ProjectileManager::new(ProjectileConfig {
             speed: 1.5,
@@ -262,21 +237,52 @@ impl MyGame {
             enemy_projectiles,
             hit_flash: 0,
             game_over: false,
-            cursor_shown: false,
+            started: false,
+            cursor_shown: true,
             aspect,
             last_mouse_x: 0.0,
             last_mouse_y: 0.0,
             last_mouse_click: false,
-            countdown: COUNTDOWN_FRAMES,
+            countdown: 0,
             hit_model: BlockFigure::new(0xFF0000),
             zbuf: Vec::new(),
         }
     }
+    fn start_game(&mut self) {
+        let floor_y = -ROOM_H / 2.0;
+        let margin = 2.0;
+        let spawn_hw = ROOM_W / 2.0 - margin;
+        let spawn_hd = ROOM_D / 2.0 - margin;
+        let enemy_rifle_ref = AssaultRifle::new(ORANGE);
+
+        for _ in 0..2 {
+            let rx = self.rand_f32() * 2.0 - 1.0;
+            let rz = self.rand_f32() * 2.0 - 1.0;
+            let mut body = CharacterBody::new(
+                Vec3::new(rx * spawn_hw, floor_y, rz * spawn_hd), CHARACTER_HEIGHT,
+            );
+            body.yaw = (-body.position.x).atan2(-body.position.z);
+            self.enemies.push(Enemy {
+                body,
+                controller: CharacterController::new(MOVE_SPEED, SPRINT_MULTIPLIER, JUMP_FORCE, GRAVITY, CROUCH_OFFSET),
+                hp: ENEMY_HP, max_hp: ENEMY_HP, alive: true, death_timer: 0,
+                action: EnemyAction { shooting: false, crouching: false, walking: false, sprinting: false, turning: false },
+                action_timer: 30, turn_rate: 0.0, aim_pitch: 0.0,
+                ammo: AmmoState::new(enemy_rifle_ref.magazine_size(), enemy_rifle_ref.reload_time()),
+            });
+        }
+
+        self.started = true;
+        self.countdown = COUNTDOWN_FRAMES;
+        self.cursor_shown = false;
+        Engine::hide_cursor();
+    }
+
     fn reset(&mut self) {
         let mut new_game = MyGame::new(self.aspect);
-        new_game.spawn_seed = self.spawn_seed; // keep seed continuity
+        new_game.spawn_seed = self.spawn_seed;
         *self = new_game;
-        Engine::hide_cursor();
+        self.start_game();
     }
 
     fn rand(&mut self) -> u32 {
@@ -320,6 +326,11 @@ impl Game for MyGame {
         self.last_mouse_x = input.mouse_x;
         self.last_mouse_y = input.mouse_y;
         self.last_mouse_click = input.mouse_left_click;
+
+        // Start screen: wait for button click (handled in render)
+        if !self.started {
+            return;
+        }
 
         // Game over: show cursor, wait for play again
         if self.game_over {
@@ -546,7 +557,7 @@ impl Game for MyGame {
         let head_targets: Vec<(Vec3, Vec3)> = self.enemies.iter()
             .map(|e| if e.alive { e.head_aabb() } else { dead_aabb(e) })
             .collect();
-        let head_hits = self.projectiles.check_hits_colored(&head_targets, Some(0xFF0000));
+        let head_hits = self.projectiles.check_hits_styled(&head_targets, Some(0xFF0000), None);
         for hit in &head_hits {
             if let Some(enemy) = self.enemies.get_mut(hit.target_index) {
                 if enemy.alive {
@@ -563,7 +574,7 @@ impl Game for MyGame {
         let body_targets: Vec<(Vec3, Vec3)> = self.enemies.iter()
             .map(|e| if e.alive { e.body_aabb() } else { dead_aabb(e) })
             .collect();
-        let body_hits = self.projectiles.check_hits_colored(&body_targets, Some(0xFF0000));
+        let body_hits = self.projectiles.check_hits_styled(&body_targets, Some(0xFF0000), Some(0.25));
         for hit in &body_hits {
             if let Some(enemy) = self.enemies.get_mut(hit.target_index) {
                 if enemy.alive {
@@ -808,6 +819,22 @@ impl Game for MyGame {
             }
         }
 
+        // Start screen
+        if !self.started {
+            let btn_cx = width / 2;
+            let btn_cy = height / 2;
+            let result = draw_button(
+                buffer, width, height,
+                "Start Game", btn_cx, btn_cy,
+                0xFFFFFF, 4, 20,
+                self.last_mouse_x, self.last_mouse_y, self.last_mouse_click,
+            );
+            if result.clicked {
+                self.start_game();
+            }
+            return;
+        }
+
         // Countdown display
         if self.countdown > 0 {
             let secs_left = (self.countdown + 59) / 60; // ceiling division
@@ -849,5 +876,6 @@ fn main() {
     let mut engine = Engine::new("Example Mantis Game");
     let aspect = engine.width() as f32 / engine.height() as f32;
     let mut game = MyGame::new(aspect);
+    Engine::show_cursor(); // show cursor for start screen
     engine.run(&mut game);
 }
