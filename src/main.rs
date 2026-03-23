@@ -1,8 +1,11 @@
-use mantis::{draw_line_3d, Bounds, Camera, Engine, Game, Input, Vec3};
+use mantis::{draw_crosshair, draw_line_3d, Bounds, Camera, CharacterController, Engine, Game, Input, Vec3};
 
 const LIME_GREEN: u32 = 0x00FF00;
 const MOUSE_SENSITIVITY: f32 = 0.003;
 const MOVE_SPEED: f32 = 0.15;
+const SPRINT_MULTIPLIER: f32 = 2.0;
+const JUMP_FORCE: f32 = 0.3;
+const GRAVITY: f32 = 0.015;
 
 // Room dimensions
 const ROOM_W: f32 = 40.0;
@@ -11,6 +14,7 @@ const ROOM_D: f32 = 40.0;
 
 struct MyGame {
     camera: Camera,
+    controller: CharacterController,
     vertices: [Vec3; 8],
     edges: [(usize, usize); 12],
     bounds: Bounds,
@@ -45,6 +49,7 @@ impl MyGame {
         ];
 
         let camera = Camera::new(Vec3::new(0.0, 0.0, 0.0), aspect);
+        let controller = CharacterController::new(MOVE_SPEED, SPRINT_MULTIPLIER, JUMP_FORCE, GRAVITY, 0.0);
 
         // Keep player inside the room with a small margin from the walls
         let margin = 0.5;
@@ -55,6 +60,7 @@ impl MyGame {
 
         MyGame {
             camera,
+            controller,
             vertices,
             edges,
             bounds,
@@ -65,12 +71,7 @@ impl MyGame {
 impl Game for MyGame {
     fn update(&mut self, input: &Input) {
         self.camera.rotate(input.mouse_dx, input.mouse_dy, MOUSE_SENSITIVITY);
-
-        if input.key_w { self.camera.move_forward(MOVE_SPEED); }
-        if input.key_s { self.camera.move_forward(-MOVE_SPEED); }
-        if input.key_d { self.camera.move_right(MOVE_SPEED); }
-        if input.key_a { self.camera.move_right(-MOVE_SPEED); }
-
+        self.controller.update(&mut self.camera, input);
         self.bounds.clamp(&mut self.camera.position);
     }
 
@@ -86,6 +87,8 @@ impl Game for MyGame {
                 LIME_GREEN,
             );
         }
+
+        draw_crosshair(buffer, width, height, 10, 0xFFFFFF);
     }
 }
 
