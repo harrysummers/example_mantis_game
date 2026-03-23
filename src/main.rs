@@ -20,19 +20,43 @@ const ROOM_H: f32 = 10.0;
 const ROOM_D: f32 = 40.0;
 
 const ORANGE: u32 = 0xFF8800;
-const PROJECTILE_DAMAGE: i32 = 40;
+const BODY_DAMAGE: i32 = 20;
+const HEAD_DAMAGE: i32 = 80;
 const ENEMY_HP: i32 = 100;
 const PLAYER_HP: i32 = 100;
+
+const RESPAWN_FRAMES: u32 = 120; // ~2 seconds at 60fps
 
 struct Enemy {
     body: CharacterBody,
     hp: i32,
     max_hp: i32,
     alive: bool,
+    death_timer: u32,
 }
 
 impl Enemy {
-    fn aabb(&self) -> (Vec3, Vec3) {
+    fn body_aabb(&self) -> (Vec3, Vec3) {
+        let hw = self.body.height * 0.18;
+        let hd = self.body.height * 0.18;
+        let neck_y = self.body.position.y + self.body.height * 0.84;
+        (
+            Vec3::new(self.body.position.x - hw, self.body.position.y, self.body.position.z - hd),
+            Vec3::new(self.body.position.x + hw, neck_y, self.body.position.z + hd),
+        )
+    }
+
+    fn head_aabb(&self) -> (Vec3, Vec3) {
+        let r = self.body.height * 0.1;
+        let neck_y = self.body.position.y + self.body.height * 0.84;
+        let top_y = self.body.position.y + self.body.height;
+        (
+            Vec3::new(self.body.position.x - r, neck_y, self.body.position.z - r),
+            Vec3::new(self.body.position.x + r, top_y, self.body.position.z + r),
+        )
+    }
+
+    fn full_aabb(&self) -> (Vec3, Vec3) {
         let hw = self.body.height * 0.18;
         let hd = self.body.height * 0.18;
         (
@@ -64,6 +88,7 @@ struct MyGame {
     enemy_rifle: AssaultRifle,
     player_hp: i32,
     player_max_hp: i32,
+    spawn_seed: u32,
 }
 
 impl MyGame {
@@ -138,8 +163,8 @@ impl MyGame {
         enemy2_body.yaw = std::f32::consts::FRAC_PI_4 + std::f32::consts::PI;
 
         let enemies = vec![
-            Enemy { body: enemy1_body, hp: ENEMY_HP, max_hp: ENEMY_HP, alive: true },
-            Enemy { body: enemy2_body, hp: ENEMY_HP, max_hp: ENEMY_HP, alive: true },
+            Enemy { body: enemy1_body, hp: ENEMY_HP, max_hp: ENEMY_HP, alive: true, death_timer: 0 },
+            Enemy { body: enemy2_body, hp: ENEMY_HP, max_hp: ENEMY_HP, alive: true, death_timer: 0 },
         ];
 
         MyGame {
@@ -164,6 +189,7 @@ impl MyGame {
             enemy_rifle: AssaultRifle::new(ORANGE),
             player_hp: PLAYER_HP,
             player_max_hp: PLAYER_HP,
+            spawn_seed: 12345,
         }
     }
 }
@@ -207,7 +233,7 @@ impl Game for MyGame {
         self.aim_point = ray_aabb_intersection(ray_origin, ray_dir, self.room_min, self.room_max);
         for enemy in &self.enemies {
             if !enemy.alive { continue; }
-            let (amin, amax) = enemy.aabb();
+            let (amin, amax) = enemy.full_aabb();
             if let Some(hit) = ray_aabb_intersection(ray_origin, ray_dir, amin, amax) {
                 let dist_hit = {
                     let d = hit.sub(ray_origin);
@@ -266,22 +292,66 @@ impl Game for MyGame {
         // Update projectiles
         self.projectiles.update(self.room_min, self.room_max);
 
-        // Check projectile hits against enemies
-        let targets: Vec<(Vec3, Vec3)> = self.enemies.iter()
-            .map(|e| if e.alive { e.aabb() } else {
-                // Dead enemies: zero-size AABB that can't be hit
-                let p = e.body.position;
-                (p, p)
-            })
+        // Check headshots first, then body shots
+        let dead_aabb = |e: &Enemy| { let p = e.body.position; (p, p) };
+
+        let head_targets: Vec<(Vec3, Vec3)> = self.enemies.iter()
+            .map(|e| if e.alive { e.head_aabb() } else { dead_aabb(e) })
             .collect();
-        let hits = self.projectiles.check_hits(&targets);
-        for hit in &hits {
+        let head_hits = self.projectiles.check_hits(&head_targets);
+        for hit in &head_hits {
             if let Some(enemy) = self.enemies.get_mut(hit.target_index) {
                 if enemy.alive {
-                    enemy.hp -= PROJECTILE_DAMAGE;
+                    enemy.hp -= HEAD_DAMAGE;
                     if enemy.hp <= 0 {
                         enemy.alive = false;
+                        enemy.death_timer = RESPAWN_FRAMES;
                     }
+                }
+            }
+        }
+
+        let body_targets: Vec<(Vec3, Vec3)> = self.enemies.iter()
+            .map(|e| if e.alive { e.body_aabb() } else { dead_aabb(e) })
+            .collect();
+        let body_hits = self.projectiles.check_hits(&body_targets);
+        for hit in &body_hits {
+            if let Some(enemy) = self.enemies.get_mut(hit.target_index) {
+                if enemy.alive {
+                    enemy.hp -= BODY_DAMAGE;
+                    if enemy.hp <= 0 {
+                        enemy.alive = false;
+                        enemy.death_timer = RESPAWN_FRAMES;
+                    }
+                }
+            }
+        }
+
+        // Respawn dead enemies after timer expires
+        let margin = 2.0;
+        let hw = ROOM_W / 2.0 - margin;
+        let hd = ROOM_D / 2.0 - margin;
+        let floor_y = -ROOM_H / 2.0;
+        for enemy in &mut self.enemies {
+            if !enemy.alive {
+                if enemy.death_timer > 0 {
+                    enemy.death_timer -= 1;
+                } else {
+                    // Simple pseudo-random position using xorshift
+                    self.spawn_seed ^= self.spawn_seed << 13;
+                    self.spawn_seed ^= self.spawn_seed >> 17;
+                    self.spawn_seed ^= self.spawn_seed << 5;
+                    let rx = (self.spawn_seed as f32 / u32::MAX as f32) * 2.0 - 1.0;
+                    self.spawn_seed ^= self.spawn_seed << 13;
+                    self.spawn_seed ^= self.spawn_seed >> 17;
+                    self.spawn_seed ^= self.spawn_seed << 5;
+                    let rz = (self.spawn_seed as f32 / u32::MAX as f32) * 2.0 - 1.0;
+
+                    enemy.body.position = Vec3::new(rx * hw, floor_y, rz * hd);
+                    // Face toward center
+                    enemy.body.yaw = (-enemy.body.position.x).atan2(-enemy.body.position.z);
+                    enemy.hp = enemy.max_hp;
+                    enemy.alive = true;
                 }
             }
         }
@@ -365,33 +435,6 @@ impl Game for MyGame {
                 character_yaw_offset, 0.0,
                 &self.enemy_rifle,
             );
-
-            // Debug: draw enemy AABB wireframe
-            let (amin, amax) = enemy.aabb();
-            let c0 = Vec3::new(amin.x, amin.y, amin.z);
-            let c1 = Vec3::new(amax.x, amin.y, amin.z);
-            let c2 = Vec3::new(amax.x, amax.y, amin.z);
-            let c3 = Vec3::new(amin.x, amax.y, amin.z);
-            let c4 = Vec3::new(amin.x, amin.y, amax.z);
-            let c5 = Vec3::new(amax.x, amin.y, amax.z);
-            let c6 = Vec3::new(amax.x, amax.y, amax.z);
-            let c7 = Vec3::new(amin.x, amax.y, amax.z);
-            let dbg = 0xFF00FF; // magenta
-            // Bottom face
-            draw_line_3d(buffer, width, height, &self.camera, c0, c1, dbg);
-            draw_line_3d(buffer, width, height, &self.camera, c1, c5, dbg);
-            draw_line_3d(buffer, width, height, &self.camera, c5, c4, dbg);
-            draw_line_3d(buffer, width, height, &self.camera, c4, c0, dbg);
-            // Top face
-            draw_line_3d(buffer, width, height, &self.camera, c3, c2, dbg);
-            draw_line_3d(buffer, width, height, &self.camera, c2, c6, dbg);
-            draw_line_3d(buffer, width, height, &self.camera, c6, c7, dbg);
-            draw_line_3d(buffer, width, height, &self.camera, c7, c3, dbg);
-            // Verticals
-            draw_line_3d(buffer, width, height, &self.camera, c0, c3, dbg);
-            draw_line_3d(buffer, width, height, &self.camera, c1, c2, dbg);
-            draw_line_3d(buffer, width, height, &self.camera, c5, c6, dbg);
-            draw_line_3d(buffer, width, height, &self.camera, c4, c7, dbg);
 
             // Enemy health bar (world-space projected to screen)
             let bar_world = Vec3::new(
