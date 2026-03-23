@@ -1,7 +1,7 @@
 use mantis::{
-    draw_character, draw_crosshair, draw_line_3d, BlockFigure, Bounds, Camera, CharacterBody,
-    CharacterController, Engine, Game, Input, OtsCameraConfig, Vec3,
-    compute_ots_camera,
+    draw_character, draw_crosshair, draw_line_3d, draw_weapon, AssaultRifle, BlockFigure,
+    Bounds, Camera, CharacterBody, CharacterController, Engine, Game, Input, OtsCameraConfig,
+    Vec3, Weapon, compute_ots_camera,
 };
 
 const LIME_GREEN: u32 = 0x00FF00;
@@ -25,6 +25,7 @@ struct MyGame {
     camera_config: OtsCameraConfig,
     camera_pitch: f32,
     model: BlockFigure,
+    rifle: AssaultRifle,
     vertices: [Vec3; 8],
     edges: [(usize, usize); 12],
     bounds: Bounds,
@@ -55,7 +56,6 @@ impl MyGame {
 
         let camera = Camera::new(Vec3::new(0.0, 0.0, 0.0), aspect);
 
-        // Character starts on the floor
         let floor_y = -hh;
         let body = CharacterBody::new(Vec3::new(0.0, floor_y, 0.0), CHARACTER_HEIGHT);
 
@@ -76,7 +76,6 @@ impl MyGame {
             pitch_max: 1.2,
         };
 
-        // Bounds: only constrain XZ (Y handled by floor/ceiling physics)
         let margin = 0.5;
         let bounds = Bounds::new(
             Vec3::new(-hw + margin, f32::NEG_INFINITY, -hd + margin),
@@ -90,6 +89,7 @@ impl MyGame {
             camera_config,
             camera_pitch: 0.15,
             model: BlockFigure::new(0xFFFFFF),
+            rifle: AssaultRifle::new(0xFFFFFF),
             vertices,
             edges,
             bounds,
@@ -99,7 +99,6 @@ impl MyGame {
 
 impl Game for MyGame {
     fn update(&mut self, input: &Input) {
-        // Mouse look: yaw rotates the character, pitch orbits the camera
         self.body.yaw += input.mouse_dx * MOUSE_SENSITIVITY;
         self.camera_pitch += input.mouse_dy * MOUSE_SENSITIVITY;
         self.camera_pitch = self.camera_pitch.clamp(
@@ -107,15 +106,12 @@ impl Game for MyGame {
             self.camera_config.pitch_max,
         );
 
-        // Physics: floor and ceiling from room geometry
         let floor_y = -ROOM_H / 2.0;
         let ceiling_y = ROOM_H / 2.0;
         self.controller.update(&mut self.body, input, floor_y, ceiling_y);
 
-        // Constrain to room boundaries (XZ only)
         self.bounds.clamp(&mut self.body.position);
 
-        // Derive camera from character body + OTS config
         let eff_height = self.controller.effective_height(self.body.height);
         compute_ots_camera(
             &self.body,
@@ -140,8 +136,10 @@ impl Game for MyGame {
             );
         }
 
-        // Draw character model
         let character_yaw_offset = -std::f32::consts::FRAC_PI_2;
+        let arm_pose = self.rifle.arm_pose();
+
+        // Draw character model with arms bent to hold weapon
         draw_character(
             buffer,
             width,
@@ -150,7 +148,24 @@ impl Game for MyGame {
             &self.body,
             self.controller.crouch_factor(),
             character_yaw_offset,
+            Some(&arm_pose),
             &self.model,
+        );
+
+        // Draw weapon
+        let crouch_factor = self.controller.crouch_factor();
+        let upper_leg_len = self.body.height * 0.22;
+        let hip_drop = upper_leg_len * crouch_factor;
+        let shoulder_y = self.body.height * 0.78 - hip_drop;
+        draw_weapon(
+            buffer,
+            width,
+            height,
+            &self.camera,
+            &self.body,
+            shoulder_y,
+            character_yaw_offset,
+            &self.rifle,
         );
 
         // Crosshair
