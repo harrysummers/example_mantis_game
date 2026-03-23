@@ -10,7 +10,7 @@ const LIME_GREEN: u32 = 0x00FF00;
 const MOUSE_SENSITIVITY: f32 = 0.003;
 const MOVE_SPEED: f32 = 0.15;
 const SPRINT_MULTIPLIER: f32 = 2.0;
-const JUMP_FORCE: f32 = 0.3;
+const JUMP_FORCE: f32 = 0.38;
 const GRAVITY: f32 = 0.015;
 const CROUCH_OFFSET: f32 = 0.5;
 const CHARACTER_HEIGHT: f32 = 3.0;
@@ -156,11 +156,13 @@ struct MyGame {
     hit_flash: u32,
     game_over: bool,
     started: bool,
+    dev_mode: bool,
     cursor_shown: bool,
     aspect: f32,
     last_mouse_x: f32,
     last_mouse_y: f32,
     last_mouse_click: bool,
+    last_shift: bool,
     countdown: u32,
     hit_model: BlockFigure,
     zbuf: Vec<f32>,
@@ -275,11 +277,13 @@ impl MyGame {
             hit_flash: 0,
             game_over: false,
             started: false,
+            dev_mode: false,
             cursor_shown: true,
             aspect,
             last_mouse_x: 0.0,
             last_mouse_y: 0.0,
             last_mouse_click: false,
+            last_shift: false,
             countdown: 0,
             hit_model: BlockFigure::new(0xFF0000),
             zbuf: Vec::new(),
@@ -353,7 +357,7 @@ impl MyGame {
         self.health_pickup.active = false;
 
         self.started = true;
-        self.countdown = COUNTDOWN_FRAMES;
+        self.countdown = if self.dev_mode { 0 } else { COUNTDOWN_FRAMES };
         self.cursor_shown = false;
         Engine::hide_cursor();
     }
@@ -406,6 +410,7 @@ impl Game for MyGame {
         self.last_mouse_x = input.mouse_x;
         self.last_mouse_y = input.mouse_y;
         self.last_mouse_click = input.mouse_left_click;
+        self.last_shift = input.key_shift;
 
         // Start screen: wait for button click (handled in render)
         if !self.started {
@@ -447,8 +452,22 @@ impl Game for MyGame {
             self.camera_config.pitch_max,
         );
 
-        let floor_y = -ROOM_H / 2.0;
+        let base_floor_y = -ROOM_H / 2.0;
         let ceiling_y = ROOM_H / 2.0;
+
+        // Compute effective floor: check if player is above a crate
+        let mut floor_y = base_floor_y;
+        for cr in &self.crates {
+            let (cmin, cmax) = cr.aabb();
+            let margin = CHARACTER_HEIGHT * 0.2; // same as collision radius
+            if self.body.position.x + margin > cmin.x && self.body.position.x - margin < cmax.x
+                && self.body.position.z + margin > cmin.z && self.body.position.z - margin < cmax.z
+                && self.body.position.y >= cmax.y - 0.1 // feet are at or above crate top
+            {
+                floor_y = floor_y.max(cmax.y);
+            }
+        }
+
         self.controller.update(&mut self.body, input, floor_y, ceiling_y);
 
         self.bounds.clamp(&mut self.body.position);
@@ -498,7 +517,7 @@ impl Game for MyGame {
             let act = enemy.action;
 
             // Shooting: face player, check line-of-sight through crates, aim, fire
-            if act.shooting {
+            if act.shooting && !self.dev_mode {
                 let dx = player_center.x - enemy.body.position.x;
                 let dz = player_center.z - enemy.body.position.z;
                 enemy.body.yaw = dz.atan2(dx);
@@ -589,7 +608,7 @@ impl Game for MyGame {
                 key_r: false,
             };
 
-            enemy.controller.update(&mut enemy.body, &fake_input, floor_y, ceiling_y);
+            enemy.controller.update(&mut enemy.body, &fake_input, base_floor_y, ceiling_y);
             self.bounds.clamp(&mut enemy.body.position);
         }
 
@@ -633,15 +652,53 @@ impl Game for MyGame {
             }
         }
         // Character-to-crate collision (push characters out of crate AABBs)
+        // Only push in XZ when feet are below the crate top (not standing/jumping on top)
+        // For player: also check a forward-projected point to account for crouch lean
+        let player_crouch = self.controller.crouch_factor();
+        let lean_forward = player_crouch * CHARACTER_HEIGHT * 0.3; // how far torso extends forward
+        let character_yaw_offset_col = -std::f32::consts::FRAC_PI_2;
+        let player_facing_yaw = self.body.yaw + character_yaw_offset_col;
+        // The torso leans in the character's local +Z which maps to this world direction
+        let lean_dx = lean_forward * player_facing_yaw.sin();
+        let lean_dz = lean_forward * player_facing_yaw.cos();
+
         for cr in &self.crates {
             let (cmin, cmax) = cr.aabb();
-            // Helper: push a body out of a crate AABB
+            // Player: check both feet position and lean tip against crate
+            if self.body.position.y < cmax.y - 0.1 {
+                // Check two points: feet and torso tip
+                let check_points = [
+                    (0.0f32, 0.0f32),          // feet
+                    (lean_dx, lean_dz),        // lean tip
+                ];
+                for &(ox, oz) in &check_points {
+                    let px = self.body.position.x + ox;
+                    let pz = self.body.position.z + oz;
+                    let char_r = collision_radius;
+                    if px + char_r > cmin.x && px - char_r < cmax.x
+                        && pz + char_r > cmin.z && pz - char_r < cmax.z
+                    {
+                        let push_xp = cmax.x + char_r - px;
+                        let push_xn = px - (cmin.x - char_r);
+                        let push_zp = cmax.z + char_r - pz;
+                        let push_zn = pz - (cmin.z - char_r);
+                        let min_push = push_xp.min(push_xn).min(push_zp).min(push_zn);
+                        // Push the feet (not the check point) so the whole body moves
+                        if min_push == push_xp { self.body.position.x = cmax.x + char_r - ox; }
+                        else if min_push == push_xn { self.body.position.x = cmin.x - char_r - ox; }
+                        else if min_push == push_zp { self.body.position.z = cmax.z + char_r - oz; }
+                        else { self.body.position.z = cmin.z - char_r - oz; }
+                        break; // re-check on next frame
+                    }
+                }
+            }
+            // Enemies with standard radius
             let mut push_out = |pos: &mut Vec3| {
+                if pos.y >= cmax.y - 0.1 { return; }
                 let char_r = collision_radius;
                 if pos.x + char_r > cmin.x && pos.x - char_r < cmax.x
                     && pos.z + char_r > cmin.z && pos.z - char_r < cmax.z
                 {
-                    // Find smallest push-out axis (X or Z)
                     let push_xp = cmax.x + char_r - pos.x;
                     let push_xn = pos.x - (cmin.x - char_r);
                     let push_zp = cmax.z + char_r - pos.z;
@@ -653,7 +710,6 @@ impl Game for MyGame {
                     else { pos.z = cmin.z - char_r; }
                 }
             };
-            push_out(&mut self.body.position);
             for enemy in &mut self.enemies {
                 if enemy.alive { push_out(&mut enemy.body.position); }
             }
@@ -720,7 +776,7 @@ impl Game for MyGame {
         }
 
         let eff_height = self.controller.effective_height(self.body.height);
-        compute_ots_camera_bounded(
+        let ideal_dir = compute_ots_camera_bounded(
             &self.body,
             eff_height,
             self.camera_pitch,
@@ -731,8 +787,11 @@ impl Game for MyGame {
         );
 
         // Compute aim pitch and aim point
+        // Use the actual camera position for raycasting (so we hit what's on screen)
+        // but use the ideal (unclamped) direction for aim_pitch so the character
+        // doesn't look up/down when the camera is pushed by wall collision.
         let ray_origin = self.camera.position;
-        let ray_dir = self.camera.direction();
+        let ray_dir = ideal_dir;
 
         let crouch_factor = self.controller.crouch_factor();
         let upper_leg_len = self.body.height * 0.22;
@@ -1140,6 +1199,7 @@ impl Game for MyGame {
                 self.last_mouse_x, self.last_mouse_y, self.last_mouse_click,
             );
             if result.clicked {
+                self.dev_mode = self.last_shift;
                 self.start_game();
             }
             return;
