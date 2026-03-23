@@ -1,7 +1,7 @@
 use mantis::{
-    draw_character, draw_crosshair, draw_line_3d, draw_weapon, AssaultRifle, BlockFigure,
-    Bounds, Camera, CharacterBody, CharacterController, Engine, Game, Input, OtsCameraConfig,
-    Vec3, Weapon, compute_ots_camera,
+    draw_character, draw_crosshair, draw_line_3d, draw_weapon, ray_aabb_intersection,
+    AssaultRifle, BlockFigure, Bounds, Camera, CharacterBody, CharacterController, Engine,
+    Game, Input, OtsCameraConfig, Vec3, Weapon, compute_ots_camera,
 };
 
 const LIME_GREEN: u32 = 0x00FF00;
@@ -24,11 +24,14 @@ struct MyGame {
     controller: CharacterController,
     camera_config: OtsCameraConfig,
     camera_pitch: f32,
+    aim_pitch: f32,
     model: BlockFigure,
     rifle: AssaultRifle,
     vertices: [Vec3; 8],
     edges: [(usize, usize); 12],
     bounds: Bounds,
+    room_min: Vec3,
+    room_max: Vec3,
 }
 
 impl MyGame {
@@ -82,17 +85,23 @@ impl MyGame {
             Vec3::new( hw - margin, f32::INFINITY,      hd - margin),
         );
 
+        let room_min = Vec3::new(-hw, -hh, -hd);
+        let room_max = Vec3::new(hw, hh, hd);
+
         MyGame {
             camera,
             body,
             controller,
             camera_config,
             camera_pitch: 0.15,
+            aim_pitch: 0.0,
             model: BlockFigure::new(0xFFFFFF),
             rifle: AssaultRifle::new(0xFFFFFF),
             vertices,
             edges,
             bounds,
+            room_min,
+            room_max,
         }
     }
 }
@@ -120,6 +129,34 @@ impl Game for MyGame {
             &self.camera_config,
             &mut self.camera,
         );
+
+        // Compute aim pitch: cast ray from camera through screen center to find aim point
+        let ray_origin = self.camera.position;
+        let ray_dir = self.camera.direction();
+
+        let crouch_factor = self.controller.crouch_factor();
+        let upper_leg_len = self.body.height * 0.22;
+        let hip_drop = upper_leg_len * crouch_factor;
+        let shoulder_y = self.body.height * 0.78 - hip_drop;
+
+        if let Some(aim_world) = ray_aabb_intersection(ray_origin, ray_dir, self.room_min, self.room_max) {
+            // Convert aim point to character-local space (undo yaw + yaw_offset rotation and translation)
+            let character_yaw_offset = -std::f32::consts::FRAC_PI_2;
+            let rotation = self.body.yaw + character_yaw_offset;
+            let relative = aim_world.sub(self.body.position);
+            let local_aim = relative.rotate_y(-rotation);
+
+            // Get muzzle position in local space (before pitch)
+            let muzzle = self.rifle.muzzle_position(self.body.height, shoulder_y);
+
+            // Compute pitch from muzzle to aim point in the YZ plane
+            let dz = local_aim.z - muzzle.z;
+            let dy = local_aim.y - muzzle.y;
+            let forward_dist = dz; // forward distance in local Z
+            if forward_dist.abs() > 0.01 {
+                self.aim_pitch = -(dy / forward_dist).atan();
+            }
+        }
     }
 
     fn render(&mut self, buffer: &mut Vec<u32>, width: usize, height: usize) {
@@ -139,7 +176,7 @@ impl Game for MyGame {
         let character_yaw_offset = -std::f32::consts::FRAC_PI_2;
         let arm_pose = self.rifle.arm_pose();
 
-        // Draw character model with arms bent to hold weapon
+        // Draw character model with upper body pitch
         draw_character(
             buffer,
             width,
@@ -149,14 +186,16 @@ impl Game for MyGame {
             self.controller.crouch_factor(),
             character_yaw_offset,
             Some(&arm_pose),
+            self.aim_pitch,
             &self.model,
         );
 
-        // Draw weapon
+        // Draw weapon with upper body pitch
         let crouch_factor = self.controller.crouch_factor();
         let upper_leg_len = self.body.height * 0.22;
         let hip_drop = upper_leg_len * crouch_factor;
         let shoulder_y = self.body.height * 0.78 - hip_drop;
+        let hip_y = self.body.height * 0.45 - hip_drop;
         draw_weapon(
             buffer,
             width,
@@ -164,7 +203,9 @@ impl Game for MyGame {
             &self.camera,
             &self.body,
             shoulder_y,
+            hip_y,
             character_yaw_offset,
+            self.aim_pitch,
             &self.rifle,
         );
 
