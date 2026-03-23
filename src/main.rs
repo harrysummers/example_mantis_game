@@ -1,5 +1,5 @@
 use mantis::{
-    draw_character, draw_crosshair, draw_line, draw_line_3d, draw_text, draw_weapon,
+    draw_button, draw_character, draw_crosshair, draw_line, draw_line_3d, draw_text, draw_weapon,
     ray_aabb_intersection, text_width, text_height, compute_muzzle_world, AmmoState, AssaultRifle,
     BlockFigure, Bounds, Camera, CharacterBody, CharacterController, Engine, Game, Input,
     OtsCameraConfig, ProjectileConfig, ProjectileManager, Vec3, Weapon, compute_ots_camera,
@@ -24,8 +24,10 @@ const BODY_DAMAGE: i32 = 20;
 const HEAD_DAMAGE: i32 = 80;
 const ENEMY_DAMAGE: i32 = 10;
 const ENEMY_HP: i32 = 100;
-const PLAYER_HP: i32 = 1000;
-const HIT_FLASH_FRAMES: u32 = 8;
+const PLAYER_HP: i32 = 500;
+const HIT_FLASH_FRAMES: u32 = 10;
+const COUNTDOWN_SECONDS: u32 = 3;
+const COUNTDOWN_FRAMES: u32 = COUNTDOWN_SECONDS * 60;
 
 const RESPAWN_FRAMES: u32 = 120; // ~2 seconds at 60fps
 const AI_MIN_FRAMES: u32 = 12;  // 0.2s at 60fps
@@ -119,6 +121,13 @@ struct MyGame {
     enemy_projectiles: ProjectileManager,
     hit_flash: u32,
     game_over: bool,
+    cursor_shown: bool,
+    aspect: f32,
+    last_mouse_x: f32,
+    last_mouse_y: f32,
+    last_mouse_click: bool,
+    countdown: u32,
+    hit_model: BlockFigure,
 }
 
 impl MyGame {
@@ -251,8 +260,22 @@ impl MyGame {
             enemy_projectiles,
             hit_flash: 0,
             game_over: false,
+            cursor_shown: false,
+            aspect,
+            last_mouse_x: 0.0,
+            last_mouse_y: 0.0,
+            last_mouse_click: false,
+            countdown: COUNTDOWN_FRAMES,
+            hit_model: BlockFigure::new(0xFF0000),
         }
     }
+    fn reset(&mut self) {
+        let mut new_game = MyGame::new(self.aspect);
+        new_game.spawn_seed = self.spawn_seed; // keep seed continuity
+        *self = new_game;
+        Engine::hide_cursor();
+    }
+
     fn rand(&mut self) -> u32 {
         self.spawn_seed ^= self.spawn_seed << 13;
         self.spawn_seed ^= self.spawn_seed >> 17;
@@ -291,8 +314,36 @@ impl MyGame {
 
 impl Game for MyGame {
     fn update(&mut self, input: &Input) {
-        // Skip all gameplay if game over
-        if self.game_over { return; }
+        self.last_mouse_x = input.mouse_x;
+        self.last_mouse_y = input.mouse_y;
+        self.last_mouse_click = input.mouse_left_click;
+
+        // Game over: show cursor, wait for play again
+        if self.game_over {
+            if !self.cursor_shown {
+                Engine::show_cursor();
+                self.cursor_shown = true;
+            }
+            return;
+        }
+
+        // Countdown: tick down, allow camera movement but no gameplay
+        if self.countdown > 0 {
+            self.countdown -= 1;
+            // Allow looking around during countdown
+            self.body.yaw += input.mouse_dx * MOUSE_SENSITIVITY;
+            self.camera_pitch += input.mouse_dy * MOUSE_SENSITIVITY;
+            self.camera_pitch = self.camera_pitch.clamp(
+                self.camera_config.pitch_min,
+                self.camera_config.pitch_max,
+            );
+            let eff_height = self.controller.effective_height(self.body.height);
+            compute_ots_camera(
+                &self.body, eff_height, self.camera_pitch,
+                &self.camera_config, &mut self.camera,
+            );
+            return;
+        }
 
         self.body.yaw += input.mouse_dx * MOUSE_SENSITIVITY;
         self.camera_pitch += input.mouse_dy * MOUSE_SENSITIVITY;
@@ -389,7 +440,7 @@ impl Game for MyGame {
 
             // Build fake input
             let fake_input = Input {
-                mouse_dx: 0.0, mouse_dy: 0.0,
+                mouse_dx: 0.0, mouse_dy: 0.0, mouse_x: 0.0, mouse_y: 0.0,
                 mouse_left_click: false, mouse_left_down: false,
                 key_w: act.walking || act.sprinting,
                 key_a: false, key_s: false, key_d: false,
@@ -600,7 +651,8 @@ impl Game for MyGame {
             arm_pose.right_upper_pitch -= offset;
         }
 
-        // Draw character model
+        // Draw character model (red when hit)
+        let player_model = if self.hit_flash > 0 { &self.hit_model } else { &self.model };
         draw_character(
             buffer,
             width,
@@ -612,7 +664,7 @@ impl Game for MyGame {
             Some(&arm_pose),
             self.aim_pitch,
             self.controller.walk_cycle(),
-            &self.model,
+            player_model,
         );
 
         // Draw weapon
@@ -659,27 +711,36 @@ impl Game for MyGame {
                 &self.enemy_rifle,
             );
 
-            // Enemy health bar (world-space projected to screen)
+            // Enemy health bar (world-space, segmented per 100 HP)
             let bar_world = Vec3::new(
                 enemy.body.position.x,
                 enemy.body.position.y + enemy.body.height + 0.5,
                 enemy.body.position.z,
             );
             if let Some((sx, sy)) = self.camera.project_point(bar_world, width, height) {
-                let bar_w: i32 = 40;
-                let bar_h: i32 = 4;
-                let bx = sx as i32 - bar_w / 2;
+                let e_segs = (enemy.max_hp / 100).max(1) as i32;
+                let e_seg_w: i32 = 12;
+                let e_seg_gap: i32 = 1;
+                let e_bar_h: i32 = 4;
+                let e_total_w = e_segs * e_seg_w + (e_segs - 1) * e_seg_gap;
+                let bx = sx as i32 - e_total_w / 2;
                 let by = sy as i32;
-                let fill = (enemy.hp as f32 / enemy.max_hp as f32 * bar_w as f32) as i32;
 
-                // Background
-                for dy in 0..bar_h {
-                    draw_line(buffer, width, height, bx, by + dy, bx + bar_w, by + dy, 0x663300);
-                }
-                // Fill
-                if fill > 0 {
-                    for dy in 0..bar_h {
-                        draw_line(buffer, width, height, bx, by + dy, bx + fill, by + dy, ORANGE);
+                for s in 0..e_segs {
+                    let seg_start = s * 100;
+                    let ex = bx + s * (e_seg_w + e_seg_gap);
+
+                    for dy in 0..e_bar_h {
+                        draw_line(buffer, width, height, ex, by + dy, ex + e_seg_w, by + dy, 0x663300);
+                    }
+                    if enemy.hp > seg_start {
+                        let frac = ((enemy.hp - seg_start) as f32 / 100.0).min(1.0);
+                        let fpx = (frac * e_seg_w as f32) as i32;
+                        if fpx > 0 {
+                            for dy in 0..e_bar_h {
+                                draw_line(buffer, width, height, ex, by + dy, ex + fpx, by + dy, ORANGE);
+                            }
+                        }
                     }
                 }
             }
@@ -712,32 +773,46 @@ impl Game for MyGame {
         let y = height - th - padding;
         draw_text(buffer, width, height, &ammo_text, x, y, 0xFFFFFF, scale);
 
-        // Player health bar below ammo text
-        let hp_bar_w: i32 = 100;
+        // Player health bar below ammo text (segmented per 100 HP)
+        let segments = (self.player_max_hp / 100) as i32;
+        let seg_w: i32 = 20; // pixels per 100 HP segment
+        let seg_gap: i32 = 2;
         let hp_bar_h: i32 = 8;
-        let hp_bar_x = width as i32 - hp_bar_w - padding as i32;
+        let total_bar_w = segments * seg_w + (segments - 1) * seg_gap;
+        let hp_bar_x = width as i32 - total_bar_w - padding as i32;
         let hp_bar_y = (y + th + 8) as i32;
-        let hp_fill = (self.player_hp as f32 / self.player_max_hp as f32 * hp_bar_w as f32) as i32;
 
-        for dy in 0..hp_bar_h {
-            draw_line(buffer, width, height, hp_bar_x, hp_bar_y + dy, hp_bar_x + hp_bar_w, hp_bar_y + dy, 0x333333);
-        }
-        if hp_fill > 0 {
+        for s in 0..segments {
+            let seg_hp_start = s * 100;
+            let sx = hp_bar_x + s * (seg_w + seg_gap);
+
+            // Background
             for dy in 0..hp_bar_h {
-                draw_line(buffer, width, height, hp_bar_x, hp_bar_y + dy, hp_bar_x + hp_fill, hp_bar_y + dy, 0xFFFFFF);
+                draw_line(buffer, width, height, sx, hp_bar_y + dy, sx + seg_w, hp_bar_y + dy, 0x333333);
+            }
+
+            // Fill proportional to HP in this segment
+            if self.player_hp > seg_hp_start {
+                let seg_fill_frac = ((self.player_hp - seg_hp_start) as f32 / 100.0).min(1.0);
+                let fill_px = (seg_fill_frac * seg_w as f32) as i32;
+                if fill_px > 0 {
+                    for dy in 0..hp_bar_h {
+                        draw_line(buffer, width, height, sx, hp_bar_y + dy, sx + fill_px, hp_bar_y + dy, 0xFFFFFF);
+                    }
+                }
             }
         }
 
-        // Red flash overlay when hit
-        if self.hit_flash > 0 {
-            let alpha = self.hit_flash as f32 / HIT_FLASH_FRAMES as f32;
-            let tint_r = (alpha * 180.0) as u32;
-            for pixel in buffer.iter_mut() {
-                let r = ((*pixel >> 16) & 0xFF).min(255 - tint_r) + tint_r;
-                let g = ((*pixel >> 8) & 0xFF) * 3 / 4;
-                let b = (*pixel & 0xFF) * 3 / 4;
-                *pixel = (r << 16) | (g << 8) | b;
-            }
+        // Countdown display
+        if self.countdown > 0 {
+            let secs_left = (self.countdown + 59) / 60; // ceiling division
+            let cd_text = format!("{}", secs_left);
+            let cd_scale = 10;
+            let cd_tw = text_width(&cd_text, cd_scale);
+            let cd_th = text_height(cd_scale);
+            let cd_x = (width - cd_tw) / 2;
+            let cd_y = (height - cd_th) / 2;
+            draw_text(buffer, width, height, &cd_text, cd_x, cd_y, 0xFFFFFF, cd_scale);
         }
 
         // Game over screen
@@ -749,6 +824,18 @@ impl Game for MyGame {
             let go_x = (width - go_tw) / 2;
             let go_y = (height - go_th) / 2;
             draw_text(buffer, width, height, go_text, go_x, go_y, 0xFF0000, go_scale);
+
+            let btn_cx = width / 2;
+            let btn_cy = go_y + go_th + 40;
+            let result = draw_button(
+                buffer, width, height,
+                "Play Again", btn_cx, btn_cy,
+                0xFF0000, 3, 16,
+                self.last_mouse_x, self.last_mouse_y, self.last_mouse_click,
+            );
+            if result.clicked {
+                self.reset();
+            }
         }
     }
 }
