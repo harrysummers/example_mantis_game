@@ -1,8 +1,8 @@
 use mantis::{
-    draw_character, draw_crosshair, draw_line_3d, draw_text, draw_weapon, ray_aabb_intersection,
-    text_width, text_height, compute_muzzle_world, AmmoState, AssaultRifle, BlockFigure, Bounds, Camera,
-    CharacterBody, CharacterController, Engine, Game, Input, OtsCameraConfig, ProjectileConfig,
-    ProjectileManager, Vec3, Weapon, compute_ots_camera,
+    draw_character, draw_crosshair, draw_line, draw_line_3d, draw_text, draw_weapon,
+    ray_aabb_intersection, text_width, text_height, compute_muzzle_world, AmmoState, AssaultRifle,
+    BlockFigure, Bounds, Camera, CharacterBody, CharacterController, Engine, Game, Input,
+    OtsCameraConfig, ProjectileConfig, ProjectileManager, Vec3, Weapon, compute_ots_camera,
 };
 
 const LIME_GREEN: u32 = 0x00FF00;
@@ -18,6 +18,29 @@ const CHARACTER_HEIGHT: f32 = 3.0;
 const ROOM_W: f32 = 40.0;
 const ROOM_H: f32 = 10.0;
 const ROOM_D: f32 = 40.0;
+
+const ORANGE: u32 = 0xFF8800;
+const PROJECTILE_DAMAGE: i32 = 40;
+const ENEMY_HP: i32 = 100;
+const PLAYER_HP: i32 = 100;
+
+struct Enemy {
+    body: CharacterBody,
+    hp: i32,
+    max_hp: i32,
+    alive: bool,
+}
+
+impl Enemy {
+    fn aabb(&self) -> (Vec3, Vec3) {
+        let hw = self.body.height * 0.18;
+        let hd = self.body.height * 0.18;
+        (
+            Vec3::new(self.body.position.x - hw, self.body.position.y, self.body.position.z - hd),
+            Vec3::new(self.body.position.x + hw, self.body.position.y + self.body.height, self.body.position.z + hd),
+        )
+    }
+}
 
 struct MyGame {
     camera: Camera,
@@ -36,6 +59,11 @@ struct MyGame {
     bounds: Bounds,
     room_min: Vec3,
     room_max: Vec3,
+    enemies: Vec<Enemy>,
+    enemy_model: BlockFigure,
+    enemy_rifle: AssaultRifle,
+    player_hp: i32,
+    player_max_hp: i32,
 }
 
 impl MyGame {
@@ -104,6 +132,16 @@ impl MyGame {
         let rifle = AssaultRifle::new(0xFFFFFF);
         let ammo = AmmoState::new(rifle.magazine_size(), rifle.reload_time());
 
+        let mut enemy1_body = CharacterBody::new(Vec3::new(-8.0, floor_y, -8.0), CHARACTER_HEIGHT);
+        enemy1_body.yaw = std::f32::consts::FRAC_PI_4; // face toward center
+        let mut enemy2_body = CharacterBody::new(Vec3::new(8.0, floor_y, 8.0), CHARACTER_HEIGHT);
+        enemy2_body.yaw = std::f32::consts::FRAC_PI_4 + std::f32::consts::PI;
+
+        let enemies = vec![
+            Enemy { body: enemy1_body, hp: ENEMY_HP, max_hp: ENEMY_HP, alive: true },
+            Enemy { body: enemy2_body, hp: ENEMY_HP, max_hp: ENEMY_HP, alive: true },
+        ];
+
         MyGame {
             camera,
             body,
@@ -121,6 +159,11 @@ impl MyGame {
             bounds,
             room_min,
             room_max,
+            enemies,
+            enemy_model: BlockFigure::new(ORANGE),
+            enemy_rifle: AssaultRifle::new(ORANGE),
+            player_hp: PLAYER_HP,
+            player_max_hp: PLAYER_HP,
         }
     }
 }
@@ -160,7 +203,27 @@ impl Game for MyGame {
         let hip_y = self.body.height * 0.45 - hip_drop;
         let character_yaw_offset = -std::f32::consts::FRAC_PI_2;
 
+        // Find closest aim target: check enemies first, then room walls
         self.aim_point = ray_aabb_intersection(ray_origin, ray_dir, self.room_min, self.room_max);
+        for enemy in &self.enemies {
+            if !enemy.alive { continue; }
+            let (amin, amax) = enemy.aabb();
+            if let Some(hit) = ray_aabb_intersection(ray_origin, ray_dir, amin, amax) {
+                let dist_hit = {
+                    let d = hit.sub(ray_origin);
+                    d.x * d.x + d.y * d.y + d.z * d.z
+                };
+                let dist_aim = if let Some(ap) = self.aim_point {
+                    let d = ap.sub(ray_origin);
+                    d.x * d.x + d.y * d.y + d.z * d.z
+                } else {
+                    f32::INFINITY
+                };
+                if dist_hit < dist_aim {
+                    self.aim_point = Some(hit);
+                }
+            }
+        }
 
         if let Some(aim_world) = self.aim_point {
             let rotation = self.body.yaw + character_yaw_offset;
@@ -202,6 +265,26 @@ impl Game for MyGame {
 
         // Update projectiles
         self.projectiles.update(self.room_min, self.room_max);
+
+        // Check projectile hits against enemies
+        let targets: Vec<(Vec3, Vec3)> = self.enemies.iter()
+            .map(|e| if e.alive { e.aabb() } else {
+                // Dead enemies: zero-size AABB that can't be hit
+                let p = e.body.position;
+                (p, p)
+            })
+            .collect();
+        let hits = self.projectiles.check_hits(&targets);
+        for hit in &hits {
+            if let Some(enemy) = self.enemies.get_mut(hit.target_index) {
+                if enemy.alive {
+                    enemy.hp -= PROJECTILE_DAMAGE;
+                    if enemy.hp <= 0 {
+                        enemy.alive = false;
+                    }
+                }
+            }
+        }
     }
 
     fn render(&mut self, buffer: &mut Vec<u32>, width: usize, height: usize) {
@@ -262,6 +345,80 @@ impl Game for MyGame {
             &self.rifle,
         );
 
+        // Draw enemies
+        let enemy_arm_pose = self.enemy_rifle.arm_pose();
+        for enemy in &self.enemies {
+            if !enemy.alive { continue; }
+
+            draw_character(
+                buffer, width, height, &self.camera,
+                &enemy.body, 0.0, character_yaw_offset,
+                Some(&enemy_arm_pose), 0.0, 0.0,
+                &self.enemy_model,
+            );
+
+            let e_shoulder_y = enemy.body.height * 0.78;
+            let e_hip_y = enemy.body.height * 0.45;
+            draw_weapon(
+                buffer, width, height, &self.camera,
+                &enemy.body, e_shoulder_y, e_hip_y,
+                character_yaw_offset, 0.0,
+                &self.enemy_rifle,
+            );
+
+            // Debug: draw enemy AABB wireframe
+            let (amin, amax) = enemy.aabb();
+            let c0 = Vec3::new(amin.x, amin.y, amin.z);
+            let c1 = Vec3::new(amax.x, amin.y, amin.z);
+            let c2 = Vec3::new(amax.x, amax.y, amin.z);
+            let c3 = Vec3::new(amin.x, amax.y, amin.z);
+            let c4 = Vec3::new(amin.x, amin.y, amax.z);
+            let c5 = Vec3::new(amax.x, amin.y, amax.z);
+            let c6 = Vec3::new(amax.x, amax.y, amax.z);
+            let c7 = Vec3::new(amin.x, amax.y, amax.z);
+            let dbg = 0xFF00FF; // magenta
+            // Bottom face
+            draw_line_3d(buffer, width, height, &self.camera, c0, c1, dbg);
+            draw_line_3d(buffer, width, height, &self.camera, c1, c5, dbg);
+            draw_line_3d(buffer, width, height, &self.camera, c5, c4, dbg);
+            draw_line_3d(buffer, width, height, &self.camera, c4, c0, dbg);
+            // Top face
+            draw_line_3d(buffer, width, height, &self.camera, c3, c2, dbg);
+            draw_line_3d(buffer, width, height, &self.camera, c2, c6, dbg);
+            draw_line_3d(buffer, width, height, &self.camera, c6, c7, dbg);
+            draw_line_3d(buffer, width, height, &self.camera, c7, c3, dbg);
+            // Verticals
+            draw_line_3d(buffer, width, height, &self.camera, c0, c3, dbg);
+            draw_line_3d(buffer, width, height, &self.camera, c1, c2, dbg);
+            draw_line_3d(buffer, width, height, &self.camera, c5, c6, dbg);
+            draw_line_3d(buffer, width, height, &self.camera, c4, c7, dbg);
+
+            // Enemy health bar (world-space projected to screen)
+            let bar_world = Vec3::new(
+                enemy.body.position.x,
+                enemy.body.position.y + enemy.body.height + 0.5,
+                enemy.body.position.z,
+            );
+            if let Some((sx, sy)) = self.camera.project_point(bar_world, width, height) {
+                let bar_w: i32 = 40;
+                let bar_h: i32 = 4;
+                let bx = sx as i32 - bar_w / 2;
+                let by = sy as i32;
+                let fill = (enemy.hp as f32 / enemy.max_hp as f32 * bar_w as f32) as i32;
+
+                // Background
+                for dy in 0..bar_h {
+                    draw_line(buffer, width, height, bx, by + dy, bx + bar_w, by + dy, 0x663300);
+                }
+                // Fill
+                if fill > 0 {
+                    for dy in 0..bar_h {
+                        draw_line(buffer, width, height, bx, by + dy, bx + fill, by + dy, ORANGE);
+                    }
+                }
+            }
+        }
+
         // Draw projectiles
         self.projectiles.draw(buffer, width, height, &self.camera);
 
@@ -277,6 +434,22 @@ impl Game for MyGame {
         let x = width - tw - padding;
         let y = height - th - padding;
         draw_text(buffer, width, height, &ammo_text, x, y, 0xFFFFFF, scale);
+
+        // Player health bar below ammo text
+        let hp_bar_w: i32 = 100;
+        let hp_bar_h: i32 = 8;
+        let hp_bar_x = width as i32 - hp_bar_w - padding as i32;
+        let hp_bar_y = (y + th + 8) as i32;
+        let hp_fill = (self.player_hp as f32 / self.player_max_hp as f32 * hp_bar_w as f32) as i32;
+
+        for dy in 0..hp_bar_h {
+            draw_line(buffer, width, height, hp_bar_x, hp_bar_y + dy, hp_bar_x + hp_bar_w, hp_bar_y + dy, 0x333333);
+        }
+        if hp_fill > 0 {
+            for dy in 0..hp_bar_h {
+                draw_line(buffer, width, height, hp_bar_x, hp_bar_y + dy, hp_bar_x + hp_fill, hp_bar_y + dy, 0xFFFFFF);
+            }
+        }
     }
 }
 
