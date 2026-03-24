@@ -87,6 +87,7 @@ struct Enemy {
     alive: bool,
     dying: bool,        // playing death animation
     death_anim: u32,    // counts up from 0 to DEATH_TOTAL_FRAMES
+    death_max_tilt: f32, // max tilt angle before clipping into wall/crate
     death_timer: u32,   // respawn countdown (starts after death anim)
     action: EnemyAction,
     action_timer: u32,
@@ -190,6 +191,10 @@ struct MyGame {
     melee_hit: bool,
     player_dying: bool,
     player_death_anim: u32,
+    player_death_max_tilt: f32,
+    paused: bool,
+    exit_requested: bool,
+    last_escape: bool,
 }
 
 impl MyGame {
@@ -320,6 +325,10 @@ impl MyGame {
             melee_hit: false,
             player_dying: false,
             player_death_anim: 0,
+            player_death_max_tilt: std::f32::consts::FRAC_PI_2,
+            paused: false,
+            exit_requested: false,
+            last_escape: false,
         }
     }
     fn start_game(&mut self) {
@@ -369,7 +378,7 @@ impl MyGame {
             self.enemies.push(Enemy {
                 body,
                 controller: CharacterController::new(MOVE_SPEED, SPRINT_MULTIPLIER, JUMP_FORCE, GRAVITY, CROUCH_OFFSET),
-                hp: ENEMY_HP, max_hp: ENEMY_HP, alive: true, dying: false, death_anim: 0, death_timer: 0,
+                hp: ENEMY_HP, max_hp: ENEMY_HP, alive: true, dying: false, death_anim: 0, death_max_tilt: std::f32::consts::FRAC_PI_2, death_timer: 0,
                 action: EnemyAction { shooting: false, crouching: false, walking: false, sprinting: false, turning: false, melee: false },
                 action_timer: 30, turn_rate: 0.0, aim_pitch: 0.0,
                 ammo: AmmoState::new(enemy_rifle_ref.magazine_size(), enemy_rifle_ref.reload_time()),
@@ -432,6 +441,60 @@ impl MyGame {
     }
 }
 
+/// Compute the max death tilt angle so the character doesn't clip through walls or crates.
+fn compute_death_max_tilt(pos: Vec3, yaw: f32, height: f32, crates: &[Crate]) -> f32 {
+    // The character falls backward opposite to facing direction.
+    let back_x = -yaw.cos();
+    let back_z = -yaw.sin();
+
+    // When tilted by angle θ, the head moves backward by height * sin(θ).
+    // Max θ = asin(available_distance / height)
+    let margin = 0.3;
+    let hw = ROOM_W / 2.0;
+    let hd = ROOM_D / 2.0;
+    let mut min_dist = f32::INFINITY;
+
+    // Check room walls
+    if back_x > 0.001 { min_dist = min_dist.min((hw - pos.x) / back_x); }
+    else if back_x < -0.001 { min_dist = min_dist.min((-hw - pos.x) / back_x); }
+    if back_z > 0.001 { min_dist = min_dist.min((hd - pos.z) / back_z); }
+    else if back_z < -0.001 { min_dist = min_dist.min((-hd - pos.z) / back_z); }
+
+    // Check crates via ray-AABB intersection in XZ
+    for cr in crates {
+        let (cmin, cmax) = cr.aabb();
+        let mut t_near = f32::NEG_INFINITY;
+        let mut t_far = f32::INFINITY;
+
+        if back_x.abs() > 0.001 {
+            let t1 = (cmin.x - pos.x) / back_x;
+            let t2 = (cmax.x - pos.x) / back_x;
+            let (tn, tf) = if t1 < t2 { (t1, t2) } else { (t2, t1) };
+            t_near = t_near.max(tn);
+            t_far = t_far.min(tf);
+        } else if pos.x < cmin.x || pos.x > cmax.x { continue; }
+
+        if back_z.abs() > 0.001 {
+            let t1 = (cmin.z - pos.z) / back_z;
+            let t2 = (cmax.z - pos.z) / back_z;
+            let (tn, tf) = if t1 < t2 { (t1, t2) } else { (t2, t1) };
+            t_near = t_near.max(tn);
+            t_far = t_far.min(tf);
+        } else if pos.z < cmin.z || pos.z > cmax.z { continue; }
+
+        if t_near <= t_far && t_far > 0.0 && t_near > 0.0 {
+            min_dist = min_dist.min(t_near);
+        }
+    }
+
+    let available = (min_dist - margin).max(0.0);
+    if available >= height {
+        std::f32::consts::FRAC_PI_2
+    } else {
+        (available / height).asin()
+    }
+}
+
 impl Game for MyGame {
     fn update(&mut self, input: &Input) {
         self.last_mouse_x = input.mouse_x;
@@ -441,6 +504,27 @@ impl Game for MyGame {
 
         // Start screen: wait for button click (handled in render)
         if !self.started {
+            self.last_escape = input.key_escape;
+            return;
+        }
+
+        // Toggle pause on Escape rising edge
+        let escape_pressed = input.key_escape && !self.last_escape;
+        self.last_escape = input.key_escape;
+
+        if escape_pressed && !self.game_over && !self.player_dying {
+            self.paused = !self.paused;
+            if self.paused {
+                Engine::show_cursor();
+                self.cursor_shown = true;
+            } else {
+                Engine::hide_cursor();
+                self.cursor_shown = false;
+            }
+        }
+
+        // Paused: show cursor, wait for button click (handled in render)
+        if self.paused {
             return;
         }
 
@@ -644,6 +728,7 @@ impl Game for MyGame {
                 key_ctrl: act.crouching,
                 key_r: false,
                 key_f: false,
+                key_escape: false,
             };
 
             enemy.controller.update(&mut enemy.body, &fake_input, base_floor_y, ceiling_y);
@@ -677,6 +762,7 @@ impl Game for MyGame {
                             self.player_hp = 0;
                             self.player_dying = true;
                             self.player_death_anim = 0;
+                            self.player_death_max_tilt = compute_death_max_tilt(self.body.position, self.body.yaw, self.body.height, &self.crates);
                         }
                     }
                 }
@@ -961,6 +1047,7 @@ impl Game for MyGame {
                             enemy.hp = 0;
                             enemy.dying = true;
                             enemy.death_anim = 0;
+                            enemy.death_max_tilt = compute_death_max_tilt(enemy.body.position, enemy.body.yaw, enemy.body.height, &self.crates);
                             self.score += 1;
                         }
                         break; // only hit one enemy per swing
@@ -993,12 +1080,14 @@ impl Game for MyGame {
             .collect();
         let head_hits = self.projectiles.check_hits_styled(&head_targets, Some(0xFF0000), None);
         for hit in &head_hits {
+            let crates_ref = &self.crates;
             if let Some(enemy) = self.enemies.get_mut(hit.target_index) {
                 if enemy.alive && !enemy.dying {
                     enemy.hp -= HEAD_DAMAGE;
                     if enemy.hp <= 0 {
                         enemy.dying = true;
                         enemy.death_anim = 0;
+                        enemy.death_max_tilt = compute_death_max_tilt(enemy.body.position, enemy.body.yaw, enemy.body.height, crates_ref);
                         self.score += 1;
                     }
                 }
@@ -1010,12 +1099,14 @@ impl Game for MyGame {
             .collect();
         let body_hits = self.projectiles.check_hits_styled(&body_targets, Some(0xFF0000), Some(0.25));
         for hit in &body_hits {
+            let crates_ref = &self.crates;
             if let Some(enemy) = self.enemies.get_mut(hit.target_index) {
                 if enemy.alive && !enemy.dying {
                     enemy.hp -= BODY_DAMAGE;
                     if enemy.hp <= 0 {
                         enemy.dying = true;
                         enemy.death_anim = 0;
+                        enemy.death_max_tilt = compute_death_max_tilt(enemy.body.position, enemy.body.yaw, enemy.body.height, crates_ref);
                         self.score += 1;
                     }
                 }
@@ -1041,6 +1132,7 @@ impl Game for MyGame {
                     self.player_hp = 0;
                     self.player_dying = true;
                     self.player_death_anim = 0;
+                    self.player_death_max_tilt = compute_death_max_tilt(self.body.position, self.body.yaw, self.body.height, &self.crates);
                 }
             }
         }
@@ -1079,6 +1171,7 @@ impl Game for MyGame {
                     enemy.alive = true;
                     enemy.dying = false;
                     enemy.death_anim = 0;
+                    enemy.death_max_tilt = std::f32::consts::FRAC_PI_2;
                     enemy.controller = CharacterController::new(
                         MOVE_SPEED, SPRINT_MULTIPLIER, JUMP_FORCE, GRAVITY, CROUCH_OFFSET,
                     );
@@ -1210,10 +1303,10 @@ impl Game for MyGame {
         };
 
         let player_fill = if self.hit_flash > 0 { 0xFF0000 } else if self.player_heal_flash > 0 { GREEN } else { 0xFFFFFF };
-        // Player death tilt
+        // Player death tilt (capped by available space)
         let player_death_tilt = if self.player_dying || self.game_over {
             let t = (self.player_death_anim as f32 / DEATH_FALL_FRAMES as f32).min(1.0);
-            t * std::f32::consts::FRAC_PI_2
+            t * self.player_death_max_tilt
         } else {
             0.0
         };
@@ -1260,10 +1353,10 @@ impl Game for MyGame {
                 e_arm_pose.right_lower_pitch -= e_swing * 0.3;
             }
 
-            // Enemy death tilt
+            // Enemy death tilt (capped by available space)
             let e_death_tilt = if enemy.dying {
                 let t = (enemy.death_anim as f32 / DEATH_FALL_FRAMES as f32).min(1.0);
-                t * std::f32::consts::FRAC_PI_2
+                t * enemy.death_max_tilt
             } else {
                 0.0
             };
@@ -1419,6 +1512,51 @@ impl Game for MyGame {
             draw_text(buffer, width, height, &cd_text, cd_x, cd_y, 0xFFFFFF, cd_scale);
         }
 
+        // Pause menu
+        if self.paused {
+            // Dim the screen
+            for pixel in buffer.iter_mut() {
+                let r = (*pixel >> 16) & 0xFF;
+                let g = (*pixel >> 8) & 0xFF;
+                let b = *pixel & 0xFF;
+                *pixel = ((r / 3) << 16) | ((g / 3) << 8) | (b / 3);
+            }
+
+            let pause_scale = 5;
+            let pause_text = "PAUSED";
+            let pause_tw = text_width(pause_text, pause_scale);
+            let pause_th = text_height(pause_scale);
+            let pause_x = (width - pause_tw) / 2;
+            let pause_y = height / 2 - pause_th - 40;
+            draw_text(buffer, width, height, pause_text, pause_x, pause_y, 0xFFFFFF, pause_scale);
+
+            // Restart button
+            let btn_cx = width / 2;
+            let btn_restart_cy = pause_y + pause_th + 50;
+            let restart_result = draw_button(
+                buffer, width, height,
+                "Restart Game", btn_cx, btn_restart_cy,
+                0xFFFFFF, 3, 16,
+                self.last_mouse_x, self.last_mouse_y, self.last_mouse_click,
+            );
+            if restart_result.clicked {
+                self.paused = false;
+                self.reset();
+            }
+
+            // Exit button
+            let btn_exit_cy = btn_restart_cy + 60;
+            let exit_result = draw_button(
+                buffer, width, height,
+                "Exit Game", btn_cx, btn_exit_cy,
+                0xFFFFFF, 3, 16,
+                self.last_mouse_x, self.last_mouse_y, self.last_mouse_click,
+            );
+            if exit_result.clicked {
+                self.exit_requested = true;
+            }
+        }
+
         // Game over screen
         if self.game_over {
             let go_scale = 6;
@@ -1440,7 +1578,22 @@ impl Game for MyGame {
             if result.clicked {
                 self.reset();
             }
+
+            let btn_exit_cy = btn_cy + 60;
+            let exit_result = draw_button(
+                buffer, width, height,
+                "Exit Game", btn_cx, btn_exit_cy,
+                0xFF0000, 3, 16,
+                self.last_mouse_x, self.last_mouse_y, self.last_mouse_click,
+            );
+            if exit_result.clicked {
+                self.exit_requested = true;
+            }
         }
+    }
+
+    fn should_exit(&self) -> bool {
+        self.exit_requested
     }
 }
 
