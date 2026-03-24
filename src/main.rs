@@ -1,6 +1,6 @@
 use mantis::{
     draw_button, draw_character, draw_character_filled, draw_crosshair, draw_filled_quad_3d,
-    draw_line, draw_line_3d, draw_text, draw_weapon, draw_weapon_filled,
+    draw_line, draw_line_3d, draw_text, draw_weapon, draw_weapon_filled, draw_weapon_filled_ex,
     ray_aabb_intersection, text_width, text_height, compute_muzzle_world, AmmoState, AssaultRifle,
     BlockFigure, Bounds, Camera, CharacterBody, CharacterController, Engine, Game, Input,
     OtsCameraConfig, ProjectileConfig, ProjectileManager, Vec3, Weapon, compute_ots_camera_bounded,
@@ -29,6 +29,11 @@ const PLAYER_HP: i32 = 500;
 const HIT_FLASH_FRAMES: u32 = 10;
 const COUNTDOWN_SECONDS: u32 = 3;
 const COUNTDOWN_FRAMES: u32 = COUNTDOWN_SECONDS * 60;
+
+const MELEE_DAMAGE: i32 = 50;
+const MELEE_RANGE: f32 = 3.5; // max distance for melee hit
+const MELEE_FRAMES: u32 = 18; // total animation frames
+const MELEE_COOLDOWN: u32 = 10; // cooldown after swing before another
 
 const CRATE_SIZE: f32 = 1.5; // half-extent of cube crate
 const CRATE_HEIGHT: f32 = 2.4; // tall enough to hide crouching body, head visible when standing
@@ -67,6 +72,7 @@ struct EnemyAction {
     walking: bool,
     sprinting: bool,
     turning: bool,
+    melee: bool,
 }
 
 struct Enemy {
@@ -82,6 +88,9 @@ struct Enemy {
     aim_pitch: f32,
     ammo: AmmoState,
     heal_flash: u32,
+    melee_timer: u32,
+    melee_cooldown: u32,
+    melee_hit: bool, // whether this swing already dealt damage
 }
 
 impl Enemy {
@@ -170,6 +179,9 @@ struct MyGame {
     health_pickup: HealthPickup,
     health_spawn_timer: u32,
     player_heal_flash: u32,
+    melee_timer: u32,
+    melee_cooldown: u32,
+    melee_hit: bool,
 }
 
 impl MyGame {
@@ -295,6 +307,9 @@ impl MyGame {
             },
             health_spawn_timer: 0,
             player_heal_flash: 0,
+            melee_timer: 0,
+            melee_cooldown: 0,
+            melee_hit: false,
         }
     }
     fn start_game(&mut self) {
@@ -345,10 +360,11 @@ impl MyGame {
                 body,
                 controller: CharacterController::new(MOVE_SPEED, SPRINT_MULTIPLIER, JUMP_FORCE, GRAVITY, CROUCH_OFFSET),
                 hp: ENEMY_HP, max_hp: ENEMY_HP, alive: true, death_timer: 0,
-                action: EnemyAction { shooting: false, crouching: false, walking: false, sprinting: false, turning: false },
+                action: EnemyAction { shooting: false, crouching: false, walking: false, sprinting: false, turning: false, melee: false },
                 action_timer: 30, turn_rate: 0.0, aim_pitch: 0.0,
                 ammo: AmmoState::new(enemy_rifle_ref.magazine_size(), enemy_rifle_ref.reload_time()),
                 heal_flash: 0,
+                melee_timer: 0, melee_cooldown: 0, melee_hit: false,
             });
         }
 
@@ -385,22 +401,23 @@ impl MyGame {
         let duration = AI_MIN_FRAMES + (self.rand_f32() * (AI_MAX_FRAMES - AI_MIN_FRAMES) as f32) as u32;
         let turn_rate = (self.rand_f32() - 0.5) * 0.06;
 
-        // 11 equally likely combos
-        let action = match self.rand() % 11 {
-            0  => EnemyAction { shooting: false, crouching: false, walking: false, sprinting: false, turning: false }, // standing
-            1  => EnemyAction { shooting: false, crouching: true,  walking: false, sprinting: false, turning: false }, // crouching
-            2  => EnemyAction { shooting: false, crouching: false, walking: false, sprinting: true,  turning: false }, // sprinting
-            3  => EnemyAction { shooting: false, crouching: false, walking: true,  sprinting: false, turning: false }, // walking
-            4  => EnemyAction { shooting: false, crouching: false, walking: false, sprinting: false, turning: true  }, // turning
-            5  => EnemyAction { shooting: false, crouching: false, walking: true,  sprinting: false, turning: true  }, // turning + walking
-            6  => EnemyAction { shooting: false, crouching: false, walking: false, sprinting: true,  turning: true  }, // turning + sprinting
-            7  => EnemyAction { shooting: true,  crouching: false, walking: false, sprinting: false, turning: false }, // standing + firing
-            8  => EnemyAction { shooting: true,  crouching: true,  walking: false, sprinting: false, turning: false }, // firing + crouching
-            9  => EnemyAction { shooting: true,  crouching: false, walking: true,  sprinting: false, turning: false }, // firing + walking
-            _  => EnemyAction { shooting: true,  crouching: false, walking: false, sprinting: true,  turning: false }, // firing + sprinting
+        // 12 equally likely combos (includes melee)
+        let action = match self.rand() % 12 {
+            0  => EnemyAction { shooting: false, crouching: false, walking: false, sprinting: false, turning: false, melee: false }, // standing
+            1  => EnemyAction { shooting: false, crouching: true,  walking: false, sprinting: false, turning: false, melee: false }, // crouching
+            2  => EnemyAction { shooting: false, crouching: false, walking: false, sprinting: true,  turning: false, melee: false }, // sprinting
+            3  => EnemyAction { shooting: false, crouching: false, walking: true,  sprinting: false, turning: false, melee: false }, // walking
+            4  => EnemyAction { shooting: false, crouching: false, walking: false, sprinting: false, turning: true,  melee: false }, // turning
+            5  => EnemyAction { shooting: false, crouching: false, walking: true,  sprinting: false, turning: true,  melee: false }, // turning + walking
+            6  => EnemyAction { shooting: false, crouching: false, walking: false, sprinting: true,  turning: true,  melee: false }, // turning + sprinting
+            7  => EnemyAction { shooting: true,  crouching: false, walking: false, sprinting: false, turning: false, melee: false }, // standing + firing
+            8  => EnemyAction { shooting: true,  crouching: true,  walking: false, sprinting: false, turning: false, melee: false }, // firing + crouching
+            9  => EnemyAction { shooting: true,  crouching: false, walking: true,  sprinting: false, turning: false, melee: false }, // firing + walking
+            10 => EnemyAction { shooting: true,  crouching: false, walking: false, sprinting: true,  turning: false, melee: false }, // firing + sprinting
+            _  => EnemyAction { shooting: false, crouching: false, walking: false, sprinting: false, turning: false, melee: true  }, // melee
         };
 
-        let turn_rate = if action.shooting { 0.0 } else { turn_rate };
+        let turn_rate = if action.shooting || action.melee { 0.0 } else { turn_rate };
         (action, duration, turn_rate)
     }
 }
@@ -489,7 +506,7 @@ impl Game for MyGame {
         let mut new_actions: Vec<Option<(EnemyAction, u32, f32)>> = Vec::new();
         for enemy in &self.enemies {
             if enemy.alive && enemy.action_timer == 0 {
-                new_actions.push(Some((EnemyAction { shooting: false, crouching: false, walking: false, sprinting: false, turning: false }, 0, 0.0)));
+                new_actions.push(Some((EnemyAction { shooting: false, crouching: false, walking: false, sprinting: false, turning: false, melee: false }, 0, 0.0)));
             } else {
                 new_actions.push(None);
             }
@@ -517,7 +534,7 @@ impl Game for MyGame {
             let act = enemy.action;
 
             // Shooting: face player, check line-of-sight through crates, aim, fire
-            if act.shooting && !self.dev_mode {
+            if act.shooting && !self.dev_mode && enemy.melee_timer == 0 {
                 let dx = player_center.x - enemy.body.position.x;
                 let dz = player_center.z - enemy.body.position.z;
                 enemy.body.yaw = dz.atan2(dx);
@@ -606,10 +623,49 @@ impl Game for MyGame {
                 key_shift: act.sprinting,
                 key_ctrl: act.crouching,
                 key_r: false,
+                key_f: false,
             };
 
             enemy.controller.update(&mut enemy.body, &fake_input, base_floor_y, ceiling_y);
             self.bounds.clamp(&mut enemy.body.position);
+
+            // Enemy melee: if melee action and near player, start a swing
+            if act.melee && !self.dev_mode {
+                let dx = self.body.position.x - enemy.body.position.x;
+                let dz = self.body.position.z - enemy.body.position.z;
+                let dist = (dx * dx + dz * dz).sqrt();
+                // Face the player when doing melee
+                enemy.body.yaw = dz.atan2(dx);
+                if dist <= MELEE_RANGE && enemy.melee_timer == 0 && enemy.melee_cooldown == 0 {
+                    enemy.melee_timer = MELEE_FRAMES;
+                    enemy.melee_hit = false;
+                }
+            }
+            // Tick enemy melee
+            if enemy.melee_timer > 0 {
+                enemy.melee_timer -= 1;
+                // Deal damage at the midpoint of the swing
+                if enemy.melee_timer == MELEE_FRAMES / 2 && !enemy.melee_hit {
+                    let dx = self.body.position.x - enemy.body.position.x;
+                    let dz = self.body.position.z - enemy.body.position.z;
+                    let dist = (dx * dx + dz * dz).sqrt();
+                    if dist <= MELEE_RANGE {
+                        self.player_hp -= MELEE_DAMAGE;
+                        self.hit_flash = HIT_FLASH_FRAMES;
+                        enemy.melee_hit = true;
+                        if self.player_hp <= 0 {
+                            self.player_hp = 0;
+                            self.game_over = true;
+                        }
+                    }
+                }
+                if enemy.melee_timer == 0 {
+                    enemy.melee_cooldown = MELEE_COOLDOWN;
+                }
+            }
+            if enemy.melee_cooldown > 0 {
+                enemy.melee_cooldown -= 1;
+            }
         }
 
         // Character-to-character collision separation
@@ -841,8 +897,8 @@ impl Game for MyGame {
             self.ammo.start_reload();
         }
 
-        // Fire projectile while mouse held and ammo available
-        if input.mouse_left_down && self.ammo.can_fire() {
+        // Fire projectile while mouse held and ammo available (not during melee)
+        if input.mouse_left_down && self.ammo.can_fire() && self.melee_timer == 0 {
             if let Some(aim_world) = self.aim_point {
                 let muzzle_world = compute_muzzle_world(
                     &self.body,
@@ -855,6 +911,47 @@ impl Game for MyGame {
                 self.projectiles.fire(muzzle_world, aim_world);
                 self.ammo.fire(self.rifle.fire_interval());
             }
+        }
+
+        // Player melee attack on F key
+        if input.key_f && self.melee_timer == 0 && self.melee_cooldown == 0 {
+            self.melee_timer = MELEE_FRAMES;
+            self.melee_hit = false;
+        }
+        if self.melee_timer > 0 {
+            self.melee_timer -= 1;
+            // Deal damage at the midpoint of the swing
+            if self.melee_timer == MELEE_FRAMES / 2 && !self.melee_hit {
+                // Check each enemy in front of the player and within range
+                let facing_x = self.body.yaw.cos();
+                let facing_z = self.body.yaw.sin();
+                for enemy in &mut self.enemies {
+                    if !enemy.alive { continue; }
+                    let dx = enemy.body.position.x - self.body.position.x;
+                    let dz = enemy.body.position.z - self.body.position.z;
+                    let dist = (dx * dx + dz * dz).sqrt();
+                    if dist > MELEE_RANGE { continue; }
+                    // Check if enemy is roughly in front (dot product > 0)
+                    let dot = dx * facing_x + dz * facing_z;
+                    if dot > 0.0 {
+                        enemy.hp -= MELEE_DAMAGE;
+                        self.melee_hit = true;
+                        if enemy.hp <= 0 {
+                            enemy.hp = 0;
+                            enemy.alive = false;
+                            enemy.death_timer = 120;
+                            self.score += 1;
+                        }
+                        break; // only hit one enemy per swing
+                    }
+                }
+            }
+            if self.melee_timer == 0 {
+                self.melee_cooldown = MELEE_COOLDOWN;
+            }
+        }
+        if self.melee_cooldown > 0 {
+            self.melee_cooldown -= 1;
         }
 
         // Tick ammo cooldown and reload timer
@@ -948,12 +1045,15 @@ impl Game for MyGame {
                     enemy.controller = CharacterController::new(
                         MOVE_SPEED, SPRINT_MULTIPLIER, JUMP_FORCE, GRAVITY, CROUCH_OFFSET,
                     );
-                    enemy.action = EnemyAction { shooting: false, crouching: false, walking: false, sprinting: false, turning: false };
+                    enemy.action = EnemyAction { shooting: false, crouching: false, walking: false, sprinting: false, turning: false, melee: false };
                     enemy.action_timer = 30;
                     enemy.turn_rate = 0.0;
                     enemy.aim_pitch = 0.0;
                     enemy.ammo = AmmoState::new(self.enemy_rifle.magazine_size(), self.enemy_rifle.reload_time());
                     enemy.heal_flash = 0;
+                    enemy.melee_timer = 0;
+                    enemy.melee_cooldown = 0;
+                    enemy.melee_hit = false;
                 }
             }
         }
@@ -1041,10 +1141,35 @@ impl Game for MyGame {
 
         // Player filled
         let mut arm_pose = self.rifle.arm_pose();
-        let weapon_pitch = if self.ammo.reloading {
-            self.aim_pitch + std::f32::consts::FRAC_PI_4
+
+        // Melee swing animation: progress 0.0 (start) -> 1.0 (end)
+        let player_melee_progress = if self.melee_timer > 0 {
+            1.0 - (self.melee_timer as f32 / MELEE_FRAMES as f32)
         } else {
-            self.aim_pitch
+            -1.0 // no melee
+        };
+
+        let (weapon_pitch, weapon_roll) = if player_melee_progress >= 0.0 {
+            // Swing animation: quickly pitch up (muzzle toward ceiling) and roll 90° (vertical rifle)
+            // Swing follows an arc: start at aim, swing up-left, return
+            let t = player_melee_progress;
+            let swing = if t < 0.5 {
+                t * 2.0 // 0..1 going up
+            } else {
+                (1.0 - t) * 2.0 // 1..0 coming back
+            };
+            // Raise arms along with the weapon swing
+            arm_pose.left_upper_pitch += swing * 1.2;
+            arm_pose.right_upper_pitch += swing * 1.2;
+            arm_pose.left_lower_pitch -= swing * 0.3; // straighten elbows a bit
+            arm_pose.right_lower_pitch -= swing * 0.3;
+            let pitch = self.aim_pitch - swing * 1.2; // swing upward
+            let roll = swing * std::f32::consts::FRAC_PI_2; // rotate 90° to vertical
+            (pitch, roll)
+        } else if self.ammo.reloading {
+            (self.aim_pitch + std::f32::consts::FRAC_PI_4, 0.0)
+        } else {
+            (self.aim_pitch, 0.0)
         };
 
         let player_fill = if self.hit_flash > 0 { 0xFF0000 } else if self.player_heal_flash > 0 { GREEN } else { 0xFFFFFF };
@@ -1060,24 +1185,41 @@ impl Game for MyGame {
         let hip_drop = upper_leg_len * crouch_factor;
         let shoulder_y = self.body.height * 0.78 - hip_drop;
         let hip_y = self.body.height * 0.45 - hip_drop;
-        draw_weapon_filled(
+        draw_weapon_filled_ex(
             buffer, &mut self.zbuf, width, height, &self.camera,
             &self.body, shoulder_y, hip_y, character_yaw_offset, weapon_pitch,
-            &self.rifle, 0x111111,
+            weapon_roll, &self.rifle, 0x111111,
         );
 
         // Enemy filled
-        let enemy_arm_pose = self.enemy_rifle.arm_pose();
+        let base_enemy_arm_pose = self.enemy_rifle.arm_pose();
         for enemy in &self.enemies {
             if !enemy.alive { continue; }
             let e_crouch = enemy.controller.crouch_factor();
             let e_walk = enemy.controller.walk_cycle();
 
+            // Compute enemy melee swing factor
+            let e_swing = if enemy.melee_timer > 0 {
+                let t = 1.0 - (enemy.melee_timer as f32 / MELEE_FRAMES as f32);
+                if t < 0.5 { t * 2.0 } else { (1.0 - t) * 2.0 }
+            } else {
+                0.0
+            };
+
+            // Modify arm pose for melee swing
+            let mut e_arm_pose = base_enemy_arm_pose;
+            if e_swing > 0.0 {
+                e_arm_pose.left_upper_pitch += e_swing * 1.2;
+                e_arm_pose.right_upper_pitch += e_swing * 1.2;
+                e_arm_pose.left_lower_pitch -= e_swing * 0.3;
+                e_arm_pose.right_lower_pitch -= e_swing * 0.3;
+            }
+
             let enemy_fill = if enemy.heal_flash > 0 { GREEN } else { 0x111111 };
             draw_character_filled(
                 buffer, &mut self.zbuf, width, height, &self.camera,
                 &enemy.body, e_crouch, character_yaw_offset,
-                Some(&enemy_arm_pose), enemy.aim_pitch, e_walk,
+                Some(&e_arm_pose), enemy.aim_pitch, e_walk,
                 &self.enemy_model, enemy_fill,
             );
 
@@ -1085,11 +1227,18 @@ impl Game for MyGame {
             let e_hip_drop = e_upper_leg * e_crouch;
             let e_shoulder_y = enemy.body.height * 0.78 - e_hip_drop;
             let e_hip_y = enemy.body.height * 0.45 - e_hip_drop;
-            draw_weapon_filled(
+
+            // Enemy melee swing animation for weapon
+            let (e_wpitch, e_wroll) = if e_swing > 0.0 {
+                (enemy.aim_pitch - e_swing * 1.2, e_swing * std::f32::consts::FRAC_PI_2)
+            } else {
+                (enemy.aim_pitch, 0.0)
+            };
+            draw_weapon_filled_ex(
                 buffer, &mut self.zbuf, width, height, &self.camera,
                 &enemy.body, e_shoulder_y, e_hip_y,
-                character_yaw_offset, enemy.aim_pitch,
-                &self.enemy_rifle, 0x111111,
+                character_yaw_offset, e_wpitch,
+                e_wroll, &self.enemy_rifle, 0x111111,
             );
         }
 
