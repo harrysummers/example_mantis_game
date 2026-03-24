@@ -4,8 +4,9 @@ use mantis::{
     ray_aabb_intersection, text_width, text_height, compute_muzzle_world, AmmoState, AssaultRifle,
     BlockFigure, Bounds, Camera, CharacterBody, CharacterController, Engine, Game, Input,
     OtsCameraConfig, ProjectileConfig, ProjectileManager, Vec3, Weapon, compute_ots_camera_bounded, compute_ots_camera_bounded_ex,
-    SprayPattern, SpraySegment,
+    SprayPattern, SpraySegment, MusicPlayer,
 };
+use std::path::Path;
 
 const MOUSE_SENSITIVITY: f32 = 0.003;
 const MOVE_SPEED: f32 = 0.15;
@@ -212,6 +213,7 @@ struct MyGame {
     recoil_pitch: f32,        // accumulated recoil pitch offset
     recoil_yaw: f32,          // accumulated recoil yaw offset
     spray_pattern: SprayPattern,
+    music: Option<MusicPlayer>,
 }
 
 impl MyGame {
@@ -382,6 +384,7 @@ impl MyGame {
             paused: false,
             exit_requested: false,
             last_escape: false,
+            music: MusicPlayer::new(Path::new("assets/music")),
         }
     }
     fn start_game(&mut self) {
@@ -551,6 +554,11 @@ fn compute_death_max_tilt(pos: Vec3, yaw: f32, height: f32, crates: &[Crate]) ->
 
 impl Game for MyGame {
     fn update(&mut self, input: &Input) {
+        // Update music — check if track finished and queue next
+        if let Some(ref mut music) = self.music {
+            music.update();
+        }
+
         self.last_mouse_x = input.mouse_x;
         self.last_mouse_y = input.mouse_y;
         self.last_mouse_click = input.mouse_left_click;
