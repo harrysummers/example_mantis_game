@@ -39,6 +39,8 @@ const MELEE_COOLDOWN: u32 = 10; // cooldown after swing before another
 // Shot 0: dead on, shots 1-14: up+right, 15-19: left, 20-24: right, 25-29: left
 const RECOIL_DECAY_RATE: f32 = 0.05;      // how fast accumulated recoil decays per frame (~60 frames to fully reset)
 const RECOIL_RESET_FRAMES: u32 = 15;     // frames before spray index resets (0.25 seconds at 60fps)
+const ENEMY_BURST_SIZE: u32 = 3;         // shots per burst at far range
+const ENEMY_FAR_RANGE: f32 = 10.0;       // distance beyond which enemies burst-fire
 
 const CRATE_SIZE: f32 = 1.5; // half-extent of cube crate
 const CRATE_HEIGHT: f32 = 2.4; // tall enough to hide crouching body, head visible when standing
@@ -107,6 +109,7 @@ struct Enemy {
     spray_reset_timer: u32,
     recoil_pitch: f32,
     recoil_yaw: f32,
+    burst_pause: u32, // frames to wait before next burst (far range only)
 }
 
 impl Enemy {
@@ -434,7 +437,7 @@ impl MyGame {
                 ammo: AmmoState::new(enemy_rifle_ref.magazine_size(), enemy_rifle_ref.reload_time()),
                 heal_flash: 0,
                 melee_timer: 0, melee_cooldown: 0, melee_hit: false,
-                spray_index: 0, spray_reset_timer: 0, recoil_pitch: 0.0, recoil_yaw: 0.0,
+                spray_index: 0, spray_reset_timer: 0, recoil_pitch: 0.0, recoil_yaw: 0.0, burst_pause: 0,
             });
         }
 
@@ -747,7 +750,28 @@ impl Game for MyGame {
                         enemy.aim_pitch = -(dy_aim / dz_aim).atan();
                     }
 
-                    if enemy.ammo.can_fire() {
+                    // Distance to player for burst vs full-auto decision
+                    let dx_p = player_center.x - enemy.body.position.x;
+                    let dz_p = player_center.z - enemy.body.position.z;
+                    let player_dist = (dx_p * dx_p + dz_p * dz_p).sqrt();
+                    let is_far = player_dist > ENEMY_FAR_RANGE;
+
+                    // At far range: burst-fire 3 shots, then pause for recoil reset
+                    // At close/medium range: full auto
+                    if enemy.burst_pause > 0 {
+                        enemy.burst_pause -= 1;
+                        // During burst pause, decay recoil
+                        if enemy.recoil_pitch.abs() > 0.001 || enemy.recoil_yaw.abs() > 0.001 {
+                            let (p, y) = self.spray_pattern.decay(enemy.recoil_pitch, enemy.recoil_yaw);
+                            enemy.recoil_pitch = p;
+                            enemy.recoil_yaw = y;
+                        }
+                        if enemy.burst_pause == 0 {
+                            enemy.spray_index = 0;
+                            enemy.recoil_pitch = 0.0;
+                            enemy.recoil_yaw = 0.0;
+                        }
+                    } else if enemy.ammo.can_fire() {
                         // Apply enemy recoil
                         let (recoil_p, recoil_y) = self.spray_pattern.recoil_for_shot(enemy.spray_index);
                         enemy.recoil_pitch = recoil_p;
@@ -774,6 +798,11 @@ impl Game for MyGame {
                         enemy.ammo.fire(self.enemy_rifle.fire_interval());
                         enemy.spray_index += 1;
                         enemy.spray_reset_timer = RECOIL_RESET_FRAMES;
+
+                        // At far range, pause after burst of 3
+                        if is_far && enemy.spray_index >= ENEMY_BURST_SIZE {
+                            enemy.burst_pause = RECOIL_RESET_FRAMES;
+                        }
                     }
                 } else {
                     enemy.aim_pitch = 0.0;
@@ -1317,6 +1346,7 @@ impl Game for MyGame {
                     enemy.spray_reset_timer = 0;
                     enemy.recoil_pitch = 0.0;
                     enemy.recoil_yaw = 0.0;
+                    enemy.burst_pause = 0;
                 }
             }
         }
