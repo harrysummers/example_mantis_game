@@ -37,7 +37,8 @@ const MELEE_COOLDOWN: u32 = 10; // cooldown after swing before another
 
 // Recoil spray pattern offsets per shot (pitch_offset, yaw_offset) in radians
 // Shot 0: dead on, shots 1-14: up+right, 15-19: left, 20-24: right, 25-29: left
-const RECOIL_DECAY_RATE: f32 = 0.12;      // how fast accumulated recoil decays when not firing
+const RECOIL_DECAY_RATE: f32 = 0.05;      // how fast accumulated recoil decays per frame (~60 frames to fully reset)
+const RECOIL_RESET_FRAMES: u32 = 15;     // frames before spray index resets (0.25 seconds at 60fps)
 
 const CRATE_SIZE: f32 = 1.5; // half-extent of cube crate
 const CRATE_HEIGHT: f32 = 2.4; // tall enough to hide crouching body, head visible when standing
@@ -103,6 +104,7 @@ struct Enemy {
     melee_cooldown: u32,
     melee_hit: bool,
     spray_index: u32,
+    spray_reset_timer: u32,
     recoil_pitch: f32,
     recoil_yaw: f32,
 }
@@ -203,6 +205,7 @@ struct MyGame {
     exit_requested: bool,
     last_escape: bool,
     spray_index: u32,         // current shot in spray pattern
+    spray_reset_timer: u32,   // frames until spray index resets
     recoil_pitch: f32,        // accumulated recoil pitch offset
     recoil_yaw: f32,          // accumulated recoil yaw offset
     spray_pattern: SprayPattern,
@@ -335,6 +338,7 @@ impl MyGame {
             melee_cooldown: 0,
             melee_hit: false,
             spray_index: 0,
+            spray_reset_timer: 0,
             recoil_pitch: 0.0,
             recoil_yaw: 0.0,
             // "7" spray pattern: dead-on first shot, then up+right 14, left 5, right 5, left 5
@@ -430,7 +434,7 @@ impl MyGame {
                 ammo: AmmoState::new(enemy_rifle_ref.magazine_size(), enemy_rifle_ref.reload_time()),
                 heal_flash: 0,
                 melee_timer: 0, melee_cooldown: 0, melee_hit: false,
-                spray_index: 0, recoil_pitch: 0.0, recoil_yaw: 0.0,
+                spray_index: 0, spray_reset_timer: 0, recoil_pitch: 0.0, recoil_yaw: 0.0,
             });
         }
 
@@ -769,26 +773,31 @@ impl Game for MyGame {
                         self.enemy_projectiles.fire(muzzle_world, recoil_target);
                         enemy.ammo.fire(self.enemy_rifle.fire_interval());
                         enemy.spray_index += 1;
+                        enemy.spray_reset_timer = RECOIL_RESET_FRAMES;
                     }
                 } else {
-                    enemy.aim_pitch = 0.0; // can't see player, don't fire
-                    // Decay enemy recoil when can't see target
+                    enemy.aim_pitch = 0.0;
                     if enemy.recoil_pitch.abs() > 0.001 || enemy.recoil_yaw.abs() > 0.001 {
                         let (p, y) = self.spray_pattern.decay(enemy.recoil_pitch, enemy.recoil_yaw);
                         enemy.recoil_pitch = p;
                         enemy.recoil_yaw = y;
                     }
-                    enemy.spray_index = 0;
+                    if enemy.spray_index > 0 {
+                        if enemy.spray_reset_timer > 0 { enemy.spray_reset_timer -= 1; }
+                        else { enemy.spray_index = 0; enemy.recoil_pitch = 0.0; enemy.recoil_yaw = 0.0; }
+                    }
                 }
             } else {
                 enemy.aim_pitch = 0.0;
-                // Decay enemy recoil when not shooting
                 if enemy.recoil_pitch.abs() > 0.001 || enemy.recoil_yaw.abs() > 0.001 {
                     let (p, y) = self.spray_pattern.decay(enemy.recoil_pitch, enemy.recoil_yaw);
                     enemy.recoil_pitch = p;
                     enemy.recoil_yaw = y;
                 }
-                enemy.spray_index = 0;
+                if enemy.spray_index > 0 {
+                    if enemy.spray_reset_timer > 0 { enemy.spray_reset_timer -= 1; }
+                    else { enemy.spray_index = 0; enemy.recoil_pitch = 0.0; enemy.recoil_yaw = 0.0; }
+                }
             }
 
             // Turning (only when not shooting — shooting faces player instead)
@@ -1119,6 +1128,7 @@ impl Game for MyGame {
                 self.projectiles.fire(muzzle_world, recoil_target);
                 self.ammo.fire(self.rifle.fire_interval());
                 self.spray_index += 1;
+                self.spray_reset_timer = RECOIL_RESET_FRAMES;
             }
         } else if !input.mouse_left_down {
             // Decay recoil when not firing
@@ -1127,7 +1137,16 @@ impl Game for MyGame {
                 self.recoil_pitch = p;
                 self.recoil_yaw = y;
             }
-            self.spray_index = 0;
+            // Reset spray index after a full second of not firing
+            if self.spray_index > 0 {
+                if self.spray_reset_timer > 0 {
+                    self.spray_reset_timer -= 1;
+                } else {
+                    self.spray_index = 0;
+                    self.recoil_pitch = 0.0;
+                    self.recoil_yaw = 0.0;
+                }
+            }
         }
 
         // Player melee attack on F key
@@ -1295,6 +1314,7 @@ impl Game for MyGame {
                     enemy.melee_cooldown = 0;
                     enemy.melee_hit = false;
                     enemy.spray_index = 0;
+                    enemy.spray_reset_timer = 0;
                     enemy.recoil_pitch = 0.0;
                     enemy.recoil_yaw = 0.0;
                 }
