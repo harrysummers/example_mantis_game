@@ -3,7 +3,7 @@ use mantis::{
     draw_line, draw_line_3d, draw_text, draw_weapon, draw_weapon_filled, draw_weapon_filled_ex, draw_weapon_filled_tilted,
     ray_aabb_intersection, text_width, text_height, compute_muzzle_world, AmmoState, AssaultRifle,
     BlockFigure, Bounds, Camera, CharacterBody, CharacterController, Engine, Game, Input,
-    OtsCameraConfig, ProjectileConfig, ProjectileManager, Vec3, Weapon, compute_ots_camera_bounded,
+    OtsCameraConfig, ProjectileConfig, ProjectileManager, Vec3, Weapon, compute_ots_camera_bounded, compute_ots_camera_bounded_ex,
     SprayPattern, SpraySegment,
 };
 
@@ -1056,7 +1056,8 @@ impl Game for MyGame {
         }
 
         let eff_height = self.controller.effective_height(self.body.height);
-        let ideal_dir = compute_ots_camera_bounded(
+        let crate_aabbs_cam: Vec<(Vec3, Vec3)> = self.crates.iter().map(|c| c.aabb()).collect();
+        let ideal_dir = compute_ots_camera_bounded_ex(
             &self.body,
             eff_height,
             self.camera_pitch,
@@ -1064,6 +1065,7 @@ impl Game for MyGame {
             &mut self.camera,
             Some(self.room_min),
             Some(self.room_max),
+            &crate_aabbs_cam,
         );
 
         // Compute aim pitch and aim point
