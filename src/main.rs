@@ -4,9 +4,9 @@ use mantis::{
     ray_aabb_intersection, text_width, text_height, compute_muzzle_world, AmmoState, AssaultRifle,
     BlockFigure, Bounds, Camera, CharacterBody, CharacterController, Engine, Game, Input,
     OtsCameraConfig, ProjectileConfig, ProjectileManager, Vec3, Weapon, compute_ots_camera_bounded,
+    SprayPattern, SpraySegment,
 };
 
-const LIME_GREEN: u32 = 0x00FF00;
 const MOUSE_SENSITIVITY: f32 = 0.003;
 const MOVE_SPEED: f32 = 0.15;
 const SPRINT_MULTIPLIER: f32 = 2.0;
@@ -34,6 +34,10 @@ const MELEE_DAMAGE: i32 = 50;
 const MELEE_RANGE: f32 = 3.5; // max distance for melee hit
 const MELEE_FRAMES: u32 = 18; // total animation frames
 const MELEE_COOLDOWN: u32 = 10; // cooldown after swing before another
+
+// Recoil spray pattern offsets per shot (pitch_offset, yaw_offset) in radians
+// Shot 0: dead on, shots 1-14: up+right, 15-19: left, 20-24: right, 25-29: left
+const RECOIL_DECAY_RATE: f32 = 0.12;      // how fast accumulated recoil decays when not firing
 
 const CRATE_SIZE: f32 = 1.5; // half-extent of cube crate
 const CRATE_HEIGHT: f32 = 2.4; // tall enough to hide crouching body, head visible when standing
@@ -98,6 +102,9 @@ struct Enemy {
     melee_timer: u32,
     melee_cooldown: u32,
     melee_hit: bool,
+    spray_index: u32,
+    recoil_pitch: f32,
+    recoil_yaw: f32,
 }
 
 impl Enemy {
@@ -195,6 +202,10 @@ struct MyGame {
     paused: bool,
     exit_requested: bool,
     last_escape: bool,
+    spray_index: u32,         // current shot in spray pattern
+    recoil_pitch: f32,        // accumulated recoil pitch offset
+    recoil_yaw: f32,          // accumulated recoil yaw offset
+    spray_pattern: SprayPattern,
 }
 
 impl MyGame {
@@ -323,6 +334,41 @@ impl MyGame {
             melee_timer: 0,
             melee_cooldown: 0,
             melee_hit: false,
+            spray_index: 0,
+            recoil_pitch: 0.0,
+            recoil_yaw: 0.0,
+            // "7" spray pattern: dead-on first shot, then up+right 14, left 5, right 5, left 5
+            spray_pattern: SprayPattern::new(vec![
+                SpraySegment { shots: 1, pitch_per_shot: -0.016, yaw_per_shot: -0.008 }, // 1
+                SpraySegment { shots: 1, pitch_per_shot: -0.004, yaw_per_shot: -0.002 }, // 2
+                SpraySegment { shots: 1, pitch_per_shot: -0.018, yaw_per_shot: -0.006 }, // 3
+                SpraySegment { shots: 1, pitch_per_shot: -0.016, yaw_per_shot: -0.004 }, // 4
+                SpraySegment { shots: 1, pitch_per_shot: -0.018, yaw_per_shot: 0.002 }, // 5
+                SpraySegment { shots: 1, pitch_per_shot: -0.016, yaw_per_shot: -0.012 }, // 6
+                SpraySegment { shots: 1, pitch_per_shot: -0.012, yaw_per_shot: 0.006 }, // 7
+                SpraySegment { shots: 1, pitch_per_shot: -0.010, yaw_per_shot: -0.008 }, // 8
+                SpraySegment { shots: 1, pitch_per_shot: -0.016, yaw_per_shot: -0.004 }, // 9
+                SpraySegment { shots: 1, pitch_per_shot: -0.008, yaw_per_shot: -0.002 }, // 10
+                SpraySegment { shots: 1, pitch_per_shot: -0.016, yaw_per_shot: -0.008 }, // 11
+                SpraySegment { shots: 1, pitch_per_shot: -0.016, yaw_per_shot: -0.008 }, // 12
+                SpraySegment { shots: 1, pitch_per_shot: -0.020, yaw_per_shot: 0.004 }, // 13
+                SpraySegment { shots: 1, pitch_per_shot: -0.016, yaw_per_shot: -0.006 }, // 14
+                SpraySegment { shots: 1, pitch_per_shot: -0.016, yaw_per_shot: -0.002 }, // 15
+                SpraySegment { shots: 1, pitch_per_shot: -0.0, yaw_per_shot: 0.016 }, // 16
+                SpraySegment { shots: 1, pitch_per_shot: -0.002, yaw_per_shot: 0.014 }, // 17
+                SpraySegment { shots: 1, pitch_per_shot: 0.002, yaw_per_shot: 0.012 }, // 18
+                SpraySegment { shots: 1, pitch_per_shot: 0.002, yaw_per_shot: 0.018 }, // 19
+                SpraySegment { shots: 1, pitch_per_shot: -0.004, yaw_per_shot: -0.004 }, // 20
+                SpraySegment { shots: 1, pitch_per_shot: 0.0, yaw_per_shot: 0.002 }, // 21
+                SpraySegment { shots: 1, pitch_per_shot: -0.002, yaw_per_shot: -0.008 }, // 22
+                SpraySegment { shots: 1, pitch_per_shot: -0.004, yaw_per_shot: -0.018 }, // 23
+                SpraySegment { shots: 1, pitch_per_shot: 0.006, yaw_per_shot: -0.008 }, // 24
+                SpraySegment { shots: 1, pitch_per_shot: 0.0, yaw_per_shot: 0.004 }, // 25
+                SpraySegment { shots: 1, pitch_per_shot: 0.002, yaw_per_shot: -0.008 }, // 26
+                SpraySegment { shots: 1, pitch_per_shot: -0.002, yaw_per_shot: 0.018 }, // 27
+                SpraySegment { shots: 1, pitch_per_shot: -0.002, yaw_per_shot: 0.016 }, // 28
+                SpraySegment { shots: 1, pitch_per_shot: 0.002, yaw_per_shot: 0.014 }, // 29
+            ], RECOIL_DECAY_RATE),
             player_dying: false,
             player_death_anim: 0,
             player_death_max_tilt: std::f32::consts::FRAC_PI_2,
@@ -384,6 +430,7 @@ impl MyGame {
                 ammo: AmmoState::new(enemy_rifle_ref.magazine_size(), enemy_rifle_ref.reload_time()),
                 heal_flash: 0,
                 melee_timer: 0, melee_cooldown: 0, melee_hit: false,
+                spray_index: 0, recoil_pitch: 0.0, recoil_yaw: 0.0,
             });
         }
 
@@ -697,19 +744,51 @@ impl Game for MyGame {
                     }
 
                     if enemy.ammo.can_fire() {
+                        // Apply enemy recoil
+                        let (recoil_p, recoil_y) = self.spray_pattern.recoil_for_shot(enemy.spray_index);
+                        enemy.recoil_pitch = recoil_p;
+                        enemy.recoil_yaw = recoil_y;
+
                         let muzzle_world = compute_muzzle_world(
                             &enemy.body, &self.enemy_rifle,
                             e_shoulder_y, e_hip_y,
                             character_yaw_offset, enemy.aim_pitch,
                         );
-                        self.enemy_projectiles.fire(muzzle_world, target);
+
+                        // Offset target by recoil
+                        let aim_dir = target.sub(muzzle_world);
+                        let dist = (aim_dir.x * aim_dir.x + aim_dir.y * aim_dir.y + aim_dir.z * aim_dir.z).sqrt();
+                        let e_rot = enemy.body.yaw + character_yaw_offset;
+                        let right_x = e_rot.cos();
+                        let right_z = -e_rot.sin();
+                        let recoil_target = Vec3::new(
+                            target.x + right_x * enemy.recoil_yaw * dist,
+                            target.y - enemy.recoil_pitch * dist,
+                            target.z + right_z * enemy.recoil_yaw * dist,
+                        );
+                        self.enemy_projectiles.fire(muzzle_world, recoil_target);
                         enemy.ammo.fire(self.enemy_rifle.fire_interval());
+                        enemy.spray_index += 1;
                     }
                 } else {
                     enemy.aim_pitch = 0.0; // can't see player, don't fire
+                    // Decay enemy recoil when can't see target
+                    if enemy.recoil_pitch.abs() > 0.001 || enemy.recoil_yaw.abs() > 0.001 {
+                        let (p, y) = self.spray_pattern.decay(enemy.recoil_pitch, enemy.recoil_yaw);
+                        enemy.recoil_pitch = p;
+                        enemy.recoil_yaw = y;
+                    }
+                    enemy.spray_index = 0;
                 }
             } else {
                 enemy.aim_pitch = 0.0;
+                // Decay enemy recoil when not shooting
+                if enemy.recoil_pitch.abs() > 0.001 || enemy.recoil_yaw.abs() > 0.001 {
+                    let (p, y) = self.spray_pattern.decay(enemy.recoil_pitch, enemy.recoil_yaw);
+                    enemy.recoil_pitch = p;
+                    enemy.recoil_yaw = y;
+                }
+                enemy.spray_index = 0;
             }
 
             // Turning (only when not shooting — shooting faces player instead)
@@ -1002,11 +1081,19 @@ impl Game for MyGame {
         // Reload on R key
         if input.key_r {
             self.ammo.start_reload();
+            self.spray_index = 0;
+            self.recoil_pitch = 0.0;
+            self.recoil_yaw = 0.0;
         }
 
         // Fire projectile while mouse held and ammo available (not during melee)
         if input.mouse_left_down && self.ammo.can_fire() && self.melee_timer == 0 {
             if let Some(aim_world) = self.aim_point {
+                // Get recoil offset for current shot in spray pattern
+                let (recoil_p, recoil_y) = self.spray_pattern.recoil_for_shot(self.spray_index);
+                self.recoil_pitch = recoil_p;
+                self.recoil_yaw = recoil_y;
+
                 let muzzle_world = compute_muzzle_world(
                     &self.body,
                     &self.rifle,
@@ -1015,9 +1102,32 @@ impl Game for MyGame {
                     character_yaw_offset,
                     self.aim_pitch,
                 );
-                self.projectiles.fire(muzzle_world, aim_world);
+
+                // Apply recoil as offset to the aim target:
+                // Compute camera right and up vectors to offset the aim point
+                let aim_dir = aim_world.sub(muzzle_world);
+                let dist = (aim_dir.x * aim_dir.x + aim_dir.y * aim_dir.y + aim_dir.z * aim_dir.z).sqrt();
+                // Right vector (perpendicular to aim dir in XZ plane)
+                let right_x = (self.body.yaw + character_yaw_offset).cos();
+                let right_z = -(self.body.yaw + character_yaw_offset).sin();
+                // Offset aim target by recoil amounts scaled by distance
+                let recoil_target = Vec3::new(
+                    aim_world.x + right_x * self.recoil_yaw * dist,
+                    aim_world.y - self.recoil_pitch * dist, // negative pitch = up
+                    aim_world.z + right_z * self.recoil_yaw * dist,
+                );
+                self.projectiles.fire(muzzle_world, recoil_target);
                 self.ammo.fire(self.rifle.fire_interval());
+                self.spray_index += 1;
             }
+        } else if !input.mouse_left_down {
+            // Decay recoil when not firing
+            if self.recoil_pitch.abs() > 0.001 || self.recoil_yaw.abs() > 0.001 {
+                let (p, y) = self.spray_pattern.decay(self.recoil_pitch, self.recoil_yaw);
+                self.recoil_pitch = p;
+                self.recoil_yaw = y;
+            }
+            self.spray_index = 0;
         }
 
         // Player melee attack on F key
@@ -1184,6 +1294,9 @@ impl Game for MyGame {
                     enemy.melee_timer = 0;
                     enemy.melee_cooldown = 0;
                     enemy.melee_hit = false;
+                    enemy.spray_index = 0;
+                    enemy.recoil_pitch = 0.0;
+                    enemy.recoil_yaw = 0.0;
                 }
             }
         }
