@@ -46,7 +46,7 @@ const ENEMY_FAR_RANGE: f32 = 10.0;       // distance beyond which enemies burst-
 const CRATE_SIZE: f32 = 1.5; // half-extent of cube crate
 const CRATE_HEIGHT: f32 = 2.4; // tall enough to hide crouching body, head visible when standing
 const CRATE_COLOR: u32 = 0x4A2A12; // dark opaque brown
-const NUM_CRATES: usize = 2;
+const NUM_CRATES: usize = 5;
 
 const HEALTH_PICKUP_AMOUNT: i32 = 100;
 const HEALTH_SPAWN_MIN: u32 = 30 * 60; // 30 seconds
@@ -62,13 +62,16 @@ const AI_MAX_FRAMES: u32 = 120; // 2.0s at 60fps
 #[derive(Clone, Copy)]
 struct Crate {
     position: Vec3, // center of base on the floor
+    half_w: f32,    // half-extent in X
+    half_d: f32,    // half-extent in Z
+    height: f32,    // height of the crate
 }
 
 impl Crate {
     fn aabb(&self) -> (Vec3, Vec3) {
         (
-            Vec3::new(self.position.x - CRATE_SIZE, self.position.y, self.position.z - CRATE_SIZE),
-            Vec3::new(self.position.x + CRATE_SIZE, self.position.y + CRATE_HEIGHT, self.position.z + CRATE_SIZE),
+            Vec3::new(self.position.x - self.half_w, self.position.y, self.position.z - self.half_d),
+            Vec3::new(self.position.x + self.half_w, self.position.y + self.height, self.position.z + self.half_d),
         )
     }
 }
@@ -394,30 +397,48 @@ impl MyGame {
         let spawn_hd = ROOM_D / 2.0 - margin;
 
         // Spawn crates (non-overlapping, away from player spawn)
+        // 3 variants: normal, tall (2x height), long (2x width in a random axis)
         self.crates.clear();
         for _ in 0..NUM_CRATES {
+            // Pick a random variant: 0 = normal, 1 = tall, 2 = long
+            let variant = self.rand() % 3;
+            let (hw, hd, h) = match variant {
+                0 => (CRATE_SIZE, CRATE_SIZE, CRATE_HEIGHT),               // normal
+                1 => (CRATE_SIZE, CRATE_SIZE, CRATE_HEIGHT * 2.0),         // tall
+                _ => {
+                    // long: double one horizontal axis randomly
+                    if self.rand() % 2 == 0 {
+                        (CRATE_SIZE * 2.0, CRATE_SIZE, CRATE_HEIGHT)       // long in X
+                    } else {
+                        (CRATE_SIZE, CRATE_SIZE * 2.0, CRATE_HEIGHT)       // long in Z
+                    }
+                }
+            };
+
             loop {
                 let rx = self.rand_f32() * 2.0 - 1.0;
                 let rz = self.rand_f32() * 2.0 - 1.0;
-                let pos = Vec3::new(rx * (spawn_hw - CRATE_SIZE), floor_y, rz * (spawn_hd - CRATE_SIZE));
+                let pos = Vec3::new(rx * (spawn_hw - hw), floor_y, rz * (spawn_hd - hd));
 
                 // Check not too close to player spawn (0,0)
                 let dist_player = (pos.x * pos.x + pos.z * pos.z).sqrt();
                 if dist_player < 5.0 { continue; }
 
-                // Check not overlapping other crates
+                // Check not overlapping other crates (use combined half-extents + gap)
                 let mut overlaps = false;
                 for existing in &self.crates {
                     let dx = (pos.x - existing.position.x).abs();
                     let dz = (pos.z - existing.position.z).abs();
-                    if dx < CRATE_SIZE * 3.0 && dz < CRATE_SIZE * 3.0 {
+                    let min_dx = hw + existing.half_w + 1.0;
+                    let min_dz = hd + existing.half_d + 1.0;
+                    if dx < min_dx && dz < min_dz {
                         overlaps = true;
                         break;
                     }
                 }
                 if overlaps { continue; }
 
-                self.crates.push(Crate { position: pos });
+                self.crates.push(Crate { position: pos, half_w: hw, half_d: hd, height: h });
                 break;
             }
         }
