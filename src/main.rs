@@ -1,6 +1,6 @@
 use mantis::{
-    draw_button, draw_character, draw_character_filled, draw_crosshair, draw_filled_quad_3d,
-    draw_line, draw_line_3d, draw_text, draw_weapon, draw_weapon_filled, draw_weapon_filled_ex,
+    draw_button, draw_character, draw_character_filled, draw_character_filled_tilted, draw_crosshair, draw_filled_quad_3d,
+    draw_line, draw_line_3d, draw_text, draw_weapon, draw_weapon_filled, draw_weapon_filled_ex, draw_weapon_filled_tilted,
     ray_aabb_intersection, text_width, text_height, compute_muzzle_world, AmmoState, AssaultRifle,
     BlockFigure, Bounds, Camera, CharacterBody, CharacterController, Engine, Game, Input,
     OtsCameraConfig, ProjectileConfig, ProjectileManager, Vec3, Weapon, compute_ots_camera_bounded,
@@ -75,13 +75,19 @@ struct EnemyAction {
     melee: bool,
 }
 
+const DEATH_FALL_FRAMES: u32 = 30;  // frames to fall backward
+const DEATH_LAY_FRAMES: u32 = 60;   // frames to lay on ground before disappearing
+const DEATH_TOTAL_FRAMES: u32 = DEATH_FALL_FRAMES + DEATH_LAY_FRAMES;
+
 struct Enemy {
     body: CharacterBody,
     controller: CharacterController,
     hp: i32,
     max_hp: i32,
     alive: bool,
-    death_timer: u32,
+    dying: bool,        // playing death animation
+    death_anim: u32,    // counts up from 0 to DEATH_TOTAL_FRAMES
+    death_timer: u32,   // respawn countdown (starts after death anim)
     action: EnemyAction,
     action_timer: u32,
     turn_rate: f32,
@@ -90,7 +96,7 @@ struct Enemy {
     heal_flash: u32,
     melee_timer: u32,
     melee_cooldown: u32,
-    melee_hit: bool, // whether this swing already dealt damage
+    melee_hit: bool,
 }
 
 impl Enemy {
@@ -182,6 +188,8 @@ struct MyGame {
     melee_timer: u32,
     melee_cooldown: u32,
     melee_hit: bool,
+    player_dying: bool,
+    player_death_anim: u32,
 }
 
 impl MyGame {
@@ -310,6 +318,8 @@ impl MyGame {
             melee_timer: 0,
             melee_cooldown: 0,
             melee_hit: false,
+            player_dying: false,
+            player_death_anim: 0,
         }
     }
     fn start_game(&mut self) {
@@ -359,7 +369,7 @@ impl MyGame {
             self.enemies.push(Enemy {
                 body,
                 controller: CharacterController::new(MOVE_SPEED, SPRINT_MULTIPLIER, JUMP_FORCE, GRAVITY, CROUCH_OFFSET),
-                hp: ENEMY_HP, max_hp: ENEMY_HP, alive: true, death_timer: 0,
+                hp: ENEMY_HP, max_hp: ENEMY_HP, alive: true, dying: false, death_anim: 0, death_timer: 0,
                 action: EnemyAction { shooting: false, crouching: false, walking: false, sprinting: false, turning: false, melee: false },
                 action_timer: 30, turn_rate: 0.0, aim_pitch: 0.0,
                 ammo: AmmoState::new(enemy_rifle_ref.magazine_size(), enemy_rifle_ref.reload_time()),
@@ -443,6 +453,15 @@ impl Game for MyGame {
             return;
         }
 
+        // Player death animation
+        if self.player_dying {
+            self.player_death_anim += 1;
+            if self.player_death_anim >= DEATH_TOTAL_FRAMES {
+                self.game_over = true;
+            }
+            return; // no input while dying
+        }
+
         // Countdown: tick down, allow camera movement but no gameplay
         if self.countdown > 0 {
             self.countdown -= 1;
@@ -518,6 +537,7 @@ impl Game for MyGame {
         }
         for (i, enemy) in self.enemies.iter_mut().enumerate() {
             if !enemy.alive { continue; }
+            if enemy.dying { continue; } // skip AI for dying enemies
 
             if let Some(Some((action, duration, turn_rate))) = new_actions.get(i) {
                 enemy.action = *action;
@@ -653,9 +673,10 @@ impl Game for MyGame {
                         self.player_hp -= MELEE_DAMAGE;
                         self.hit_flash = HIT_FLASH_FRAMES;
                         enemy.melee_hit = true;
-                        if self.player_hp <= 0 {
+                        if self.player_hp <= 0 && !self.player_dying {
                             self.player_hp = 0;
-                            self.game_over = true;
+                            self.player_dying = true;
+                            self.player_death_anim = 0;
                         }
                     }
                 }
@@ -859,7 +880,7 @@ impl Game for MyGame {
         // Find closest aim target: check enemies first, then room walls
         self.aim_point = ray_aabb_intersection(ray_origin, ray_dir, self.room_min, self.room_max);
         for enemy in &self.enemies {
-            if !enemy.alive { continue; }
+            if !enemy.alive || enemy.dying { continue; }
             let (amin, amax) = enemy.full_aabb();
             if let Some(hit) = ray_aabb_intersection(ray_origin, ray_dir, amin, amax) {
                 let dist_hit = {
@@ -926,7 +947,7 @@ impl Game for MyGame {
                 let facing_x = self.body.yaw.cos();
                 let facing_z = self.body.yaw.sin();
                 for enemy in &mut self.enemies {
-                    if !enemy.alive { continue; }
+                    if !enemy.alive || enemy.dying { continue; }
                     let dx = enemy.body.position.x - self.body.position.x;
                     let dz = enemy.body.position.z - self.body.position.z;
                     let dist = (dx * dx + dz * dz).sqrt();
@@ -936,10 +957,10 @@ impl Game for MyGame {
                     if dot > 0.0 {
                         enemy.hp -= MELEE_DAMAGE;
                         self.melee_hit = true;
-                        if enemy.hp <= 0 {
+                        if enemy.hp <= 0 && !enemy.dying {
                             enemy.hp = 0;
-                            enemy.alive = false;
-                            enemy.death_timer = 120;
+                            enemy.dying = true;
+                            enemy.death_anim = 0;
                             self.score += 1;
                         }
                         break; // only hit one enemy per swing
@@ -968,16 +989,16 @@ impl Game for MyGame {
         let dead_aabb = |e: &Enemy| { let p = e.body.position; (p, p) };
 
         let head_targets: Vec<(Vec3, Vec3)> = self.enemies.iter()
-            .map(|e| if e.alive { e.head_aabb() } else { dead_aabb(e) })
+            .map(|e| if e.alive && !e.dying { e.head_aabb() } else { dead_aabb(e) })
             .collect();
         let head_hits = self.projectiles.check_hits_styled(&head_targets, Some(0xFF0000), None);
         for hit in &head_hits {
             if let Some(enemy) = self.enemies.get_mut(hit.target_index) {
-                if enemy.alive {
+                if enemy.alive && !enemy.dying {
                     enemy.hp -= HEAD_DAMAGE;
                     if enemy.hp <= 0 {
-                        enemy.alive = false;
-                        enemy.death_timer = RESPAWN_FRAMES;
+                        enemy.dying = true;
+                        enemy.death_anim = 0;
                         self.score += 1;
                     }
                 }
@@ -985,16 +1006,16 @@ impl Game for MyGame {
         }
 
         let body_targets: Vec<(Vec3, Vec3)> = self.enemies.iter()
-            .map(|e| if e.alive { e.body_aabb() } else { dead_aabb(e) })
+            .map(|e| if e.alive && !e.dying { e.body_aabb() } else { dead_aabb(e) })
             .collect();
         let body_hits = self.projectiles.check_hits_styled(&body_targets, Some(0xFF0000), Some(0.25));
         for hit in &body_hits {
             if let Some(enemy) = self.enemies.get_mut(hit.target_index) {
-                if enemy.alive {
+                if enemy.alive && !enemy.dying {
                     enemy.hp -= BODY_DAMAGE;
                     if enemy.hp <= 0 {
-                        enemy.alive = false;
-                        enemy.death_timer = RESPAWN_FRAMES;
+                        enemy.dying = true;
+                        enemy.death_anim = 0;
                         self.score += 1;
                     }
                 }
@@ -1016,9 +1037,10 @@ impl Game for MyGame {
             for _ in &hits {
                 self.player_hp -= ENEMY_DAMAGE;
                 self.hit_flash = HIT_FLASH_FRAMES;
-                if self.player_hp <= 0 {
+                if self.player_hp <= 0 && !self.player_dying {
                     self.player_hp = 0;
-                    self.game_over = true;
+                    self.player_dying = true;
+                    self.player_death_anim = 0;
                 }
             }
         }
@@ -1032,6 +1054,19 @@ impl Game for MyGame {
         let spawn_randoms: Vec<(f32, f32)> = (0..self.enemies.len())
             .map(|_| (self.rand_f32() * 2.0 - 1.0, self.rand_f32() * 2.0 - 1.0))
             .collect();
+        // Tick enemy death animations
+        for enemy in self.enemies.iter_mut() {
+            if enemy.dying && enemy.alive {
+                enemy.death_anim += 1;
+                if enemy.death_anim >= DEATH_TOTAL_FRAMES {
+                    enemy.alive = false;
+                    enemy.dying = false;
+                    enemy.death_anim = 0;
+                    enemy.death_timer = 120; // 2 seconds before respawn
+                }
+            }
+        }
+
         for (i, enemy) in self.enemies.iter_mut().enumerate() {
             if !enemy.alive {
                 if enemy.death_timer > 0 {
@@ -1042,6 +1077,8 @@ impl Game for MyGame {
                     enemy.body.yaw = (-enemy.body.position.x).atan2(-enemy.body.position.z);
                     enemy.hp = enemy.max_hp;
                     enemy.alive = true;
+                    enemy.dying = false;
+                    enemy.death_anim = 0;
                     enemy.controller = CharacterController::new(
                         MOVE_SPEED, SPRINT_MULTIPLIER, JUMP_FORCE, GRAVITY, CROUCH_OFFSET,
                     );
@@ -1173,11 +1210,19 @@ impl Game for MyGame {
         };
 
         let player_fill = if self.hit_flash > 0 { 0xFF0000 } else if self.player_heal_flash > 0 { GREEN } else { 0xFFFFFF };
-        draw_character_filled(
+        // Player death tilt
+        let player_death_tilt = if self.player_dying || self.game_over {
+            let t = (self.player_death_anim as f32 / DEATH_FALL_FRAMES as f32).min(1.0);
+            t * std::f32::consts::FRAC_PI_2
+        } else {
+            0.0
+        };
+
+        draw_character_filled_tilted(
             buffer, &mut self.zbuf, width, height, &self.camera,
             &self.body, self.controller.crouch_factor(), character_yaw_offset,
             Some(&arm_pose), self.aim_pitch, self.controller.walk_cycle(),
-            &self.model, player_fill,
+            &self.model, player_fill, player_death_tilt,
         );
 
         let crouch_factor = self.controller.crouch_factor();
@@ -1185,10 +1230,10 @@ impl Game for MyGame {
         let hip_drop = upper_leg_len * crouch_factor;
         let shoulder_y = self.body.height * 0.78 - hip_drop;
         let hip_y = self.body.height * 0.45 - hip_drop;
-        draw_weapon_filled_ex(
+        draw_weapon_filled_tilted(
             buffer, &mut self.zbuf, width, height, &self.camera,
             &self.body, shoulder_y, hip_y, character_yaw_offset, weapon_pitch,
-            weapon_roll, &self.rifle, 0x111111,
+            weapon_roll, &self.rifle, 0x111111, player_death_tilt,
         );
 
         // Enemy filled
@@ -1215,12 +1260,20 @@ impl Game for MyGame {
                 e_arm_pose.right_lower_pitch -= e_swing * 0.3;
             }
 
+            // Enemy death tilt
+            let e_death_tilt = if enemy.dying {
+                let t = (enemy.death_anim as f32 / DEATH_FALL_FRAMES as f32).min(1.0);
+                t * std::f32::consts::FRAC_PI_2
+            } else {
+                0.0
+            };
+
             let enemy_fill = if enemy.heal_flash > 0 { GREEN } else { 0x111111 };
-            draw_character_filled(
+            draw_character_filled_tilted(
                 buffer, &mut self.zbuf, width, height, &self.camera,
                 &enemy.body, e_crouch, character_yaw_offset,
                 Some(&e_arm_pose), enemy.aim_pitch, e_walk,
-                &self.enemy_model, enemy_fill,
+                &self.enemy_model, enemy_fill, e_death_tilt,
             );
 
             let e_upper_leg = enemy.body.height * 0.22;
@@ -1234,11 +1287,11 @@ impl Game for MyGame {
             } else {
                 (enemy.aim_pitch, 0.0)
             };
-            draw_weapon_filled_ex(
+            draw_weapon_filled_tilted(
                 buffer, &mut self.zbuf, width, height, &self.camera,
                 &enemy.body, e_shoulder_y, e_hip_y,
                 character_yaw_offset, e_wpitch,
-                e_wroll, &self.enemy_rifle, 0x111111,
+                e_wroll, &self.enemy_rifle, 0x111111, e_death_tilt,
             );
         }
 
@@ -1248,7 +1301,7 @@ impl Game for MyGame {
 
         // Enemy health bars
         for enemy in &self.enemies {
-            if !enemy.alive { continue; }
+            if !enemy.alive || enemy.dying { continue; }
             let bar_world = Vec3::new(
                 enemy.body.position.x,
                 enemy.body.position.y + enemy.body.height + 0.5,
